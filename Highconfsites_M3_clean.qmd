@@ -1,0 +1,1773 @@
+---
+title: "MATR3-specific editing sites identification"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+author:
+  - name: "Kim Nguyen"
+format:
+  html:
+    code-fold: TRUE
+    code-overflow: scroll
+    code-summary: "Show code"
+    code-tools: true
+    code-line-numbers: true
+    toc: true
+    toc-depth: 5
+    toc-location: right
+    toc-expand: true
+    number-sections: true
+    theme: sandstone
+    fontsize: 11pt
+    linestretch: 1.5
+    fig-format: png
+    cap-location: margin
+    body-width: 900px
+    sidebar-width: 300px
+    page-layout: full
+    crossref:
+      fig-title: Fig
+    embed-resources: true
+    link-external-newwindow: true
+    smooth-scroll: true
+    css: css.css
+    execute:
+      echo: true
+      warning: false
+---
+
+# Library
+```{r setup, message=FALSE}
+#BiocManager::install("BindingSiteFinder")
+#install.packages("ComplexUpset")
+# --- 1. Core BioConductor & Genomic Infrastructure ---
+# Essential for handling GRanges, TxDb objects, and sequence data
+library(GenomicRanges)
+library(GenomicFeatures)
+library(GenomeInfoDb)
+library(rtracklayer)
+library(Biostrings)
+library(AnnotationDbi)
+library(txdbmaker)         # Replaces older MakeTxDb functions
+library(VariantAnnotation)
+
+# --- 2. Organism Specific (Mus musculus mm39) ---
+library(org.Mm.eg.db)
+library(biomaRt)
+
+# --- 3. Tidyverse & Data Wrangling ---
+# 'tidyverse' automatically loads: ggplot2, dplyr, tidyr, readr, purrr, tibble, stringr, forcats
+library(tidyverse) 
+library(magrittr)   # For advanced piping (%<>%, %T>%)
+
+# --- 4. Functional Enrichment & Analysis ---
+library(clusterProfiler)
+library(gprofiler2)
+
+# --- 5. Visualization & Aesthetics ---
+# General Plotting Enhancements
+library(ggrepel)        # Prevent label overlap
+library(ggrastr)        # Rasterize heavy plots (essential for large CLIP/RNA-seq datasets)
+library(ggpointdensity) # High-density scatter plots
+library(ggforce)        # Specialized geoms
+library(ggpp)           # Annotations
+library(shadowtext)     # Better text readability
+
+# Color Palettes
+library(RColorBrewer)
+library(Polychrome)
+library(colorRamp2)
+
+# Set Logic & Intersections (Venn/UpSet)
+library(ggvenn)
+library(eulerr)
+library(UpSetR)
+# library(ComplexUpset) # Uncomment if you need the ggplot-native version
+
+# Specialized Plots (Networks, Alluvial, Correlations)
+library(networkD3)
+library(ggalluvial)
+library(corrplot)
+library(GGally)
+
+# Layout & Reporting
+library(gridExtra)      # Arrange multiple plots
+library(patchwork)     # (Recommended alternative to gridExtra for ggplot2)
+library(magick)         # Image processing
+library(kableExtra)     # Publication-quality tables
+library(plotly)         # Interactive plots
+library(markdown)
+```
+Genomic ranges: https://biodatascience.github.io/compbio/bioc/ranges.html 
+
+# Process data
+## BED files import
+```{r}
+# Folder path
+folder <- "/Users/tinkienoob/Master_thesis/MATR3/HT_BedGraph_files"
+
+# List all .bg files
+files <- list.files(folder, pattern = "\\.bg$", full.names = TRUE)
+
+# Import all bedGraph files into a named list
+bg_list <- lapply(files, function(f) {
+  gr <- import(f, format = "bedGraph")
+  # Filter out duplicates and keep only single-nucleotide resolution
+  gr <- gr[!duplicated(gr$NA..19)]
+  # Standardize to 1bp site (the actual editing coordinate)
+  ranges(gr) <- IRanges(start = end(gr), end = end(gr))
+  return(gr)
+})
+names(bg_list) <- gsub("\\.txt\\.bg$", "", basename(files))
+
+#n_distinct(unique(bg_list$Silke_HT_1_A2G$NA..19))
+```
+
+# Process TXT files (containing coverage/score metrics)
+```{r}
+# List all .txt files 
+txt_files <- list.files(folder, pattern = "\\.txt$", full.names = TRUE)
+
+txt_list <- lapply(txt_files, function(f) {
+  read.table(f, header = TRUE) %>%
+    dplyr::rename(start = Edit_coord) %>%
+    mutate(end = start, strand = "*") %>%
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+})
+
+names(txt_list) <- gsub("\\.txt$", "", basename(txt_files))
+```
+
+## Genomic features annotation
+### Make annotation database from gtf file
+annotation file is downloaded from: https://www.gencodegenes.org/mouse/release_M37.html
+The gencode.vM37.basic.annotation.gtf file is designed for the mouse genome assembly GRCm39 (mm39). Released around May 2025, this GENCODE dataset (vM37) 
+
+makeTxDbFromGFF builds a structural map including Only the strictly necessary coordinates to define gene structure (Chromosome, Start, End, Strand, IDs)
+while rtracklayer::import reads the full descriptive content in the GTF file (e.g., gene_id, gene_name, gene_biotype, tag) becomes a column in the metadata (mcols).
+
+```{r message=FALSE}
+annoFile = "/Users/tinkienoob/Master_thesis/MATR3/mm39_anno/gencode.vM37.basic.annotation.gtf" 
+
+# Build TxDb from GFF3
+annoDb <- txdbmaker::makeTxDbFromGFF(file = annoFile, format = "gtf")
+
+# Import full annotation for metadata
+annoInfo <- rtracklayer::import(annoFile, format = "gtf")
+
+# Save the TxDb object to file
+AnnotationDbi::saveDb(annoDb, "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/annoDb.Db")
+
+# Extract genes as GRanges
+gns <- genes(annoDb)
+
+# Strip version suffixes from GENCODE IDs (e.g., .18) ---
+#gns$gene_id <- sub("\\..*", "", gns$gene_id)
+#annoInfo$gene_id <- sub("\\..*", "", annoInfo$gene_id)
+
+# Match gene IDs between TxDb and Gtf
+idx <- match(gns$gene_id, annoInfo$gene_id)
+
+# Combine metadata from TxDb + Gtf
+meta <- cbind(elementMetadata(gns),
+              elementMetadata(annoInfo)[idx,])
+meta <- meta[,!duplicated(colnames(meta))]
+
+elementMetadata(gns) <- meta
+```
+
+# Create annotation for transcript regions
+```{r}
+  # Define regions from TxDb
+  # Count the overlaps of each binding site for each region of the transcript. 
+  cdseq <- cds(annoDb) 
+  intrns <- unlist(intronsByTranscript(annoDb), use.names=TRUE)  
+  utrs3 <- unlist(threeUTRsByTranscript(annoDb), use.names=TRUE) 
+  utrs5 <- unlist(fiveUTRsByTranscript(annoDb), use.names=TRUE) 
+  regions_list <- GRangesList(UTR5 = utrs5, UTR3 = utrs3, CDS = cdseq, Intron = intrns)
+  seqlevelsStyle(regions_list) <- "UCSC"
+  
+  # Extract all transcripts (as GRanges)
+transcripts_id <- transcripts(annoDb, columns = c("tx_id", "tx_name", "gene_id"))
+seqlevelsStyle(transcripts_id) <- "UCSC"
+  #view(as.data.frame(regions_list))
+
+saveRDS(regions_list, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/mm39_region_list.rds")
+```
+
+# Create intron length table
+```{r}
+# transcript lookup
+transcripts_id <- transcripts(annoDb, columns = c("tx_id", "tx_name", "gene_id"))
+seqlevelsStyle(transcripts_id) <- "UCSC"
+
+tx_df <- tibble(
+  tx_id   = as.character(mcols(transcripts_id)$tx_id),
+  tx_name = as.character(mcols(transcripts_id)$tx_name),
+  gene_id = as.character(unlist(mcols(transcripts_id)$gene_id))) %>%
+  distinct()
+
+# recover tx_id from names(intrns)
+intrns_df <- tibble::tibble(
+  seqnames = as.character(seqnames(intrns)),
+  start    = start(intrns),
+  end      = end(intrns),
+  strand   = as.character(strand(intrns)),
+  width    = width(intrns),
+  tx_id    = as.character(names(intrns))) %>%
+  left_join(tx_df, by = "tx_id")
+
+# Convert into Granges
+introns_gr <- GRanges(
+  seqnames = intrns_df$seqnames,
+  ranges   = IRanges(start = intrns_df$start, end = intrns_df$end),
+  strand   = intrns_df$strand,
+  tx_id    = intrns_df$tx_id,
+  tx_name  = intrns_df$tx_name,
+  gene_id  = intrns_df$gene_id
+)
+
+saveRDS(introns_gr, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/mm39_introns_gr.rds")
+```
+
+## Annotate strand for each txt GRanges
+```{r}
+# Merge TXT and BedGraph data
+# We ensure site-specific scores are attached to genomic coordinates
+gr_list <- lapply(names(txt_list), function(nm) {
+  txt_gr <- txt_list[[nm]]
+  bg_gr  <- bg_list[[nm]]
+  
+  # Find overlaps (identical coordinates)
+  hits <- findOverlaps(txt_gr, bg_gr, type = "equal")
+  res <- txt_gr[queryHits(hits)]
+  res$score <- bg_gr$score[subjectHits(hits)]
+  res$Ranges_coord <- bg_gr$NA..19[subjectHits(hits)]
+  
+  # Annotate strand from GTF
+  strand_hits <- findOverlaps(res, gns, ignore.strand = TRUE)
+  # Assign strand of the first gene hit (typical for HyperTRIBE)
+  strand(res)[queryHits(strand_hits)] <- strand(gns)[subjectHits(strand_hits)]
+  
+  return(res)
+})
+
+# Keep same names
+names(gr_list) <- names(txt_list)
+# checking unique genomic ranges (chrom, start, end, strand)
+#table(duplicated(granges(gr_list$Silke_DRRM_HT_1_A2G)))
+
+saveRDS(gr_list, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/GRanges_M3_HT_allsamples.rds")
+```
+
+# Strategy to identify true MATR3-dependent editing from background/noise events.
+```{r}
+save_thesis_plot <- function(plot, filename,
+                             width = 10, height = 6.5,
+                             dpi = 300, bg = "white") {
+  ggsave(
+    filename = filename,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = dpi,
+    bg = bg
+  )
+}
+
+
+condition_map <- c(
+  "Silke_M3_HT_1_A2G" = "MATR3", "Silke_M3_HT_2_A2G" = "MATR3", "Silke_M3_HT_3_A2G" = "MATR3", "Silke_M3_HT_4_A2G" = "MATR3",
+  "Silke_M3d_HT_1_A2G" = "ΔRRMcontrol", "Silke_M3d_HT_2_A2G" = "ΔRRMcontrol", "Silke_M3d_HT_3_A2G" = "ΔRRMcontrol", "Silke_M3d_HT_4_A2G" = "ΔRRMcontrol",
+  "Silke_HT_1_A2G" = "ADARcontrol", "Silke_HT_2_A2G" = "ADARcontrol", "Silke_HT_3_A2G" = "ADARcontrol", "Silke_HT_4_A2G" = "ADARcontrol"
+)
+```
+
+## 1st GLOBAL CUTOFF: Globale filter
+### Checking read distribution
+Most genes have very low counts, but a few genes have very high counts (up to 16k).
+That’s why filtering by a threshold is important—it removes a lot of weak/noisy signals at the bottom tail.
+```{r}
+#quantile(df_list$Silke_HT_1_A2G$Total_count, probs = seq(0,1, by = .1))
+
+par(mfrow=c(2,2)) # Loop through all data frames
+
+for (x in names(gr_list)) {
+  
+  df <- gr_list[[x]]
+  probs <- seq(0, 100, 10) # percentiles for x-axis: 0,10,…100 
+  
+  q <- quantile(df$Total_count, probs = seq(0, 1, 0.1))
+  
+  plot(probs, q, type = "b", pch = 16, lwd = 2, col = "#0E54B6FF", # type="b": Plots both points and lines connecting them.
+       main = paste("Quantile distribution of count:", x),
+       xlab = "Percentile (%)", ylab = "read counts",
+       ylim = c(0, max(q)))
+  
+  grid(col = "grey80", lty = 3)
+  text(probs, q, labels = round(q, 2), pos = 3, cex = 1, col = "#BD241EFF")
+  abline(h = q["20%"], col = "#BD241EFF", lty = 2, lwd = 2)
+}
+```
+
+
+```{r, results: asis}
+coverage_df <- imap_dfr(gr_list, ~{
+  as.data.frame(.x) %>%
+    mutate(Sample = .y)
+}) %>%
+  mutate(
+    Condition = condition_map[Sample],
+    Replicate = sub(".*_([1-4])_A2G$", "rep\\1", Sample),
+    Condition = factor(Condition, levels = c("MATR3", "ΔRRMcontrol", "ADARcontrol")),
+    Replicate = factor(Replicate, levels = c("rep1", "rep2", "rep3", "rep4")))
+
+rep_colors <- setNames(
+  colorRampPalette(c("#08306B", "#C6DBEF"))(4),
+  c("rep1", "rep2", "rep3", "rep4"))
+
+conditions <- unique(coverage_df$Condition)
+
+for (cond in conditions) {
+  
+  cat("### ", cond, "\n\n", sep = "")
+  
+  p <- ggplot(
+    coverage_df %>% filter(Condition == cond),
+    aes(x = Total_count, color = Replicate)) +
+    stat_ecdf(geom = "point", size = 0.8) +
+    geom_vline(xintercept = c(5, 10, 15), linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = rep_colors, drop = FALSE) +
+    theme_bw() +
+    labs(
+      title = cond,
+      x = "Read coverage",
+      y = "Cumulative fraction of editing sites",
+      color = "Replicates") +
+    coord_cartesian(xlim = c(0, 100)) +
+    theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(color = "black", size = 17),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.position = "right"
+  )
+  print(p)
+  
+  save_thesis_plot(
+    p,
+    paste0("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/coverage_ecdf_", cond, ".png"),
+    width = 8,
+    height = 6
+  )
+  
+  cat("\n\n")
+}
+```
+
+### Filter editing sites with sufficient coverages
+keep only sites with sufficient coverage (e.g. ≥ 5 reads = cut 20% dataset off)
+```{r}
+count_events <- function(gr_list, condition_map) {
+
+  # create empty df   
+count_events <- data.frame(
+    Condition = character(),
+    Total_unique_events = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+# for conditions in condition_map
+for (cond in unique(condition_map)) {
+  # Each name of grange in the list = 1 replicate 
+    reps <- names(condition_map[condition_map == cond])
+    
+    # Extract data, convert to DF, and bind rows 
+    combined_before <- dplyr::bind_rows(lapply(reps, function(rep) {
+      as.data.frame(gr_list[[rep]])
+    }))
+    
+    # Count unique sites (based on Ranges_coord)
+    Total_unique_events <- dplyr::n_distinct(combined_before$Ranges_coord)
+    
+    # Store results
+    count_events <- rbind(count_events, data.frame(
+      Condition = cond,
+      Total_unique_events = Total_unique_events
+    ))
+  }
+  
+  return(count_events)
+}
+
+count_events_df <- count_events(gr_list, condition_map)
+```
+
+
+### Loop for different cut-off levels for coverage (reads)
+```{r}
+cond_order <- c("MATR3", "ADARcontrol", "ΔRRMcontrol")
+coverage_cutoff <- c(0, 5, 10, 15)
+
+# Create lists to store filtered data and counts
+coverage_cutoff_list <- list()
+coverage_count_list  <- list()
+
+for (k in coverage_cutoff) {
+  
+  # Filter each replicate based on coverage cutoff
+  df_list_filtered <- lapply(names(gr_list), function(x) {
+    gr <- gr_list[[x]]
+    df <- as.data.frame(gr)
+    
+    if (k == 0) {
+      df_filtered <- df
+    } else {
+      df_filtered <- df %>%
+        dplyr::filter(Total_count >= k)
+    }
+    
+    df_filtered %>%
+      dplyr::select(Name, strand, Type, width, Ranges_coord, G_count, C_count, Total_count, score) %>%
+      dplyr::distinct()
+  })
+  
+  names(df_list_filtered) <- names(gr_list)
+  coverage_cutoff_list[[as.character(k)]] <- df_list_filtered
+  
+  # Count total unique sites per condition
+  counts <- count_events(df_list_filtered, condition_map)
+  
+  # Add stage label
+  counts$Stage <- ifelse(
+    k == 0,
+    "No coverage cutoff",
+    paste0("Coverage \u2265 ", k)
+  )
+  
+  coverage_count_list[[as.character(k)]] <- counts
+}
+
+# Combine all results
+coverage_count_list1 <- do.call(rbind, coverage_count_list)
+
+# Order condition classes
+coverage_count_list1$Condition <- factor(
+  coverage_count_list1$Condition,
+  levels = cond_order
+)
+
+# Order stages for plotting
+coverage_count_list1$Stage <- factor(
+  coverage_count_list1$Stage,
+  levels = c(
+    "No coverage cutoff",
+    "Coverage \u2265 5",
+    "Coverage \u2265 10",
+    "Coverage \u2265 15"
+  )
+)
+
+# Build plot object
+coverage_optimize <- ggplot(
+  coverage_count_list1,
+  aes(x = Condition, y = Total_unique_events, fill = Stage)
+) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.85) +
+  geom_text(
+    aes(label = scales::comma(Total_unique_events)),
+    position = position_dodge(width = 0.9),
+    vjust = 0,
+    hjust = 0,
+    size = 4.5,
+    angle = 65
+  ) +
+  scale_fill_manual(values = c(
+    "No coverage cutoff" = "#9E9E9E",
+    "Coverage \u2265 5" = "#08306B",
+    "Coverage \u2265 10" = "#6785AB",
+    "Coverage \u2265 15" = "#96AFCB"
+  )) +
+  labs(
+    title = "Editing sites across coverage cutoffs",
+    x = "",
+    y = "Number of editing sites",
+    fill = "Coverage cutoff"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    axis.text.y = element_text(size = 12)
+  ) +
+  expand_limits(y = max(coverage_count_list1$Total_unique_events) * 1.3)
+
+# Show plot
+coverage_optimize
+
+save_thesis_plot(
+  coverage_optimize,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/coverage_cutoff_optimize.png",
+  width = 8.5,
+  height = 6
+)
+```
+
+## 2nd GLOBAL CUTOFF: How strong are the sites we kept
+How is score (editing score) per site calculated from bigWig coverage? 
+score = (G/C count depend on +/- strand)/ Total count (coverage at that genomic position) * 100
+## Editing score bins by condition {.tabset}
+```{r}
+## Editing score bins by condition {.tabset}
+#| results: asis
+
+# Collect events after 1st cutoff
+df_list_tc5 <- coverage_cutoff_list[["5"]]
+
+score_df <- imap_dfr(df_list_tc5, ~{
+  .x %>%
+    mutate(Sample = .y)
+}) %>%
+  mutate(
+    Condition = condition_map[Sample],
+    Replicate = sub(".*_([1-4])_A2G$", "rep\\1", Sample),
+    Condition = factor(Condition, levels = c("MATR3", "ΔRRMcontrol", "ADARcontrol")),
+    Replicate = factor(Replicate, levels = c("rep1", "rep2", "rep3", "rep4"))
+  )
+
+conditions <- levels(score_df$Condition)
+
+for (cond in conditions) {
+  
+  cat("### ", cond, "\n\n", sep = "")
+  
+  p <- ggplot(
+  score_df %>% filter(Condition == cond),
+  aes(x = score, color = Replicate)
+) +
+  stat_ecdf(geom = "point", size = 0.8, alpha = 0.6) +
+  geom_vline(xintercept = c(1, 5, 10), linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = rep_colors, drop = FALSE) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 10)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = cond,
+    x = "Editing score (%)",
+    y = "Cumulative fraction of sites",
+    color = "Replicates"
+  ) +
+  theme_bw(base_size =20) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(color = "black", size = 17),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.position = "right"
+  )
+  
+  print(p)
+  
+  save_thesis_plot(
+    p,
+    paste0("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/editscore_dis", gsub("[^A-Za-z0-9]+", "_", cond), ".png"),
+    width = 8,
+    height = 6
+  )
+  
+  cat("\n\n")
+}
+```
+
+### Loop for different cut-off levels
+```{r}
+edit_cutoff <- c(0, 1, 3, 5, 7, 9)
+
+# Create lists to store filtered data and counts
+edit_cutoff_list <- list()
+edit_count_list  <- list()
+
+for (k in edit_cutoff) {
+  
+  # Filter each replicate based on editing score cutoff
+  df_list_filtered <- lapply(names(df_list_tc5), function(x) {
+    gr <- df_list_tc5[[x]]
+    df <- as.data.frame(gr)
+    
+    if (k == 0) {
+      df_filtered <- df
+    } else {
+      df_filtered <- df %>%
+        dplyr::filter(score >= k)
+    }
+    
+    df_filtered %>%
+      dplyr::distinct()
+  })
+  
+  # use the correct names
+  names(df_list_filtered) <- names(df_list_tc5)
+  
+  # store filtered replicate-level data
+  edit_cutoff_list[[as.character(k)]] <- df_list_filtered
+  
+  # count total unique events per condition
+  counts <- count_events(df_list_filtered, condition_map)
+  
+  # add stage label
+  counts$Stage <- ifelse(
+    k == 0,
+    "No editing score cutoff",
+    paste0("Score \u2265 ", k, "%")
+  )
+  
+  # store summary counts
+  edit_count_list[[as.character(k)]] <- counts
+}
+
+# Combine all count tables
+edit_count_list1 <- do.call(rbind, edit_count_list)
+
+# Set factor order for conditions
+edit_count_list1$Condition <- factor(
+  edit_count_list1$Condition,
+  levels = cond_order
+)
+
+# Set factor order for stages
+edit_count_list1$Stage <- factor(
+  edit_count_list1$Stage,
+  levels = c(
+    "No editing score cutoff",
+    "Score \u2265 1%",
+    "Score \u2265 3%",
+    "Score \u2265 5%",
+    "Score \u2265 7%",
+    "Score \u2265 9%"
+  )
+)
+
+# Plot
+editscore_cutoff <- ggplot(
+  edit_count_list1,
+  aes(x = Condition, y = Total_unique_events, fill = Stage)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = scales::comma(Total_unique_events)),
+    position = position_dodge(width = 0.9),
+    vjust = 0,
+    hjust = 0,
+    size = 4.5,
+    angle = 65
+  ) +
+  scale_fill_manual(values = c(
+    "No editing score cutoff" = "#9E9E9E",
+    "Score \u2265 1%" = "#08306B",
+    "Score \u2265 3%" = "#375A8B",
+    "Score \u2265 5%" = "#6785AB",
+    "Score \u2265 7%" = "#96AFCB",
+    "Score \u2265 9%" = "#C6DBEF"
+  )) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Editing sites after coverage \u2265 5 filtering across editing score cutoffs",
+    x = "",
+    y = "Number of editing sites",
+    fill = "Cutoffs"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    axis.text.y = element_text(size = 12)
+  ) +
+  expand_limits(y = max(edit_count_list1$Total_unique_events) * 1.15)
+
+save_thesis_plot(
+  editscore_cutoff,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/editscore_cutoff_optimize.png",
+  width = 8.5,
+  height = 6
+)
+
+df_list_tc5_e5 <- edit_cutoff_list[["5"]]
+df_list_tc5_e1 <- edit_cutoff_list[["1"]]
+
+editscore_cutoff
+```
+
+# Mean editing score of reproducible events
+I calculate this using rowSums(!is.na(...)). This counts how many replicates actually detected the site. This becomes our 'Reproducibility Score'—if a site has a frequency of 1, it’s a singleton/noise. If it’s 4, it’s highly robust.
+
+Mean Score: We calculate the average editing percentage across the active replicates. This gives us a single representative editing value for that genomic location
+
+## ADAR control
+```{r}
+ADAR_ctrl_list <- df_list_tc5_e5[grep("Silke_HT_", names(df_list_tc5_e5))]
+
+ADARctrl_scores <- purrr::imap(ADAR_ctrl_list, ~{
+  .x %>%
+    dplyr::select(Ranges_coord, score) %>%
+    group_by(Ranges_coord) %>%
+    summarise(score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(Condition = paste0("ADARcontrol_rep", gsub("Silke_HT_|_A2G", "", .y)))
+}) %>%
+  bind_rows()
+
+# Pivot to wider format (one column per replicate)
+ADARctrl_scores_count <- ADARctrl_scores %>%
+  pivot_wider(
+    id_cols = Ranges_coord,
+    names_from = Condition,
+    values_from = score) %>%
+  mutate(Frequency = rowSums(!is.na(across(starts_with("ADARcontrol_rep"))))) %>%
+  mutate(Mean = rowMeans(across(starts_with("ADARcontrol_rep")), na.rm = TRUE))
+```
+
+## MATR3 WT
+```{r}
+MATR3_list <- df_list_tc5_e5[grep("Silke_M3_HT_", names(df_list_tc5_e5))]
+
+MATR3_wt_scores <- purrr::imap(MATR3_list, ~{
+  .x %>%
+    dplyr::select(Ranges_coord, score) %>%
+    group_by(Ranges_coord) %>%
+    summarise(score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Condition = paste0("Matr3_wt_rep", gsub("Silke_M3_HT_|_A2G", "", .y)))
+}) %>%
+  bind_rows()
+
+# Pivot to wider format (one column per replicate)
+MATR3_wt_scores_count <- MATR3_wt_scores %>%
+  pivot_wider(
+    id_cols = Ranges_coord,
+    names_from = Condition,
+    values_from = score) %>%
+  mutate(Frequency = rowSums(!is.na(across(starts_with("Matr3_wt_rep"))))) %>%
+  mutate(Mean = rowMeans(across(starts_with("Matr3_wt_rep")), na.rm = TRUE))
+
+```
+
+## Deplete RRM
+```{r}
+ΔRRM_list <- df_list_tc5_e5[grep("Silke_M3d_HT_", names(df_list_tc5_e5))]
+
+ΔRRM_scores <- purrr::imap(ΔRRM_list, ~{
+  .x %>%
+    dplyr::select(Ranges_coord, score) %>%
+    group_by(Ranges_coord) %>%
+    summarise(score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Condition = paste0("ΔRRM_rep", gsub("Silke_M3d_HT_|_A2G", "", .y)))
+}) %>%
+  bind_rows()
+
+# Pivot to wider format (one column per replicate)
+ΔRRM_scores_count <- ΔRRM_scores %>%
+  pivot_wider(
+    id_cols = Ranges_coord,
+    names_from = Condition,
+    values_from = score) %>%
+  mutate(Frequency = rowSums(!is.na(across(starts_with("ΔRRM_rep"))))) %>%
+  mutate(Mean = rowMeans(across(starts_with("ΔRRM_rep")), na.rm = TRUE))
+```
+
+## How many events reproduce in more than 2 replicates?
+```{r}
+# Custom function to generate high-quality UpSet plots with color-coded reproducibility
+plot_reproducible_upset <- function(upset_list, filename, main_label, highlight_color = "#2171B5") {
+  
+  # 1. Transform list to UpSet format
+  upset_data <- UpSetR::fromList(upset_list)
+  set_names <- names(upset_list)
+  
+  # 2. Generate all combinations for intersections (degree >= 2)
+  shared_combos <- unlist(lapply(2:length(set_names), function(x) {
+    combn(set_names, x, simplify = FALSE)
+  }), recursive = FALSE)
+  
+  # 3. Create queries for UpSetR
+  highlight_queries <- lapply(shared_combos, function(combo) {
+    list(query = UpSetR::intersects, params = combo, color = highlight_color, active = TRUE)
+  })
+  
+  # 4. Render and Save Plot
+  png(filename = filename, width = 2600, height = 2200, res = 300, bg = "white")
+  
+  # Explicit call to UpSetR::upset to prevent namespace errors
+  p <- UpSetR::upset(
+    upset_data,
+    nsets = length(set_names),
+    order.by = "freq",
+    mainbar.y.label = main_label,
+    sets.x.label = "Editing sites / Replicate",
+    sets.bar.color = "#08306B",
+    main.bar.color = "#08306B",   # Color for singletons (degree = 1)
+    queries = highlight_queries,
+    text.scale = c(2.0, 1.6, 1.6, 1.4, 2.0, 2.2),
+    number.angles = 60
+  )
+  p$Main_bar$grobs[[6]]$children[[4]]$gp$col <- rep("black", 3)
+  p$Main_bar$grobs[[6]]$children[[4]]$hjust <- rep(0, 3)
+  
+  print(p)
+  dev.off()
+
+}
+
+```
+
+### Control (HT)
+```{r}
+ADARctrl_upsetlist <- list(
+  ADARctrl_r1 = ADAR_ctrl_list$Silke_HT_1_A2G$Ranges_coord,
+  ADARctrl_r2 = ADAR_ctrl_list$Silke_HT_2_A2G$Ranges_coord,
+  ADARctrl_r3 = ADAR_ctrl_list$Silke_HT_3_A2G$Ranges_coord,
+  ADARctrl_r4 = ADAR_ctrl_list$Silke_HT_4_A2G$Ranges_coord
+)
+
+plot_reproducible_upset(ADARctrl_upsetlist, "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/ADAR_HT_upset.png", "Shared editing sites (HT)")
+```
+
+
+## MATR3 WT
+```{r}
+MATR3_upsetlist <- list(
+        MATR3_r1 = unique(MATR3_list$Silke_M3_HT_1_A2G$Ranges_coord),
+        MATR3_r2 = unique(MATR3_list$Silke_M3_HT_2_A2G$Ranges_coord),
+        MATR3_r3 = unique(MATR3_list$Silke_M3_HT_3_A2G$Ranges_coord),
+        MATR3_r4 = unique(MATR3_list$Silke_M3_HT_4_A2G$Ranges_coord))
+
+plot_reproducible_upset(MATR3_upsetlist, "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/MATR3_HT_upset.png", "Shared editing sites (M3_HT)")
+```
+
+### Depleted RRM (M3d_HT)
+```{r}
+ΔRRM_upsetlist <- list(ΔRRM_r1 = unique(ΔRRM_list$Silke_M3d_HT_1_A2G$Ranges_coord),
+                          DRRM_r2 = unique(ΔRRM_list$Silke_M3d_HT_2_A2G$Ranges_coord),
+                          ΔRRM_r3 = unique(ΔRRM_list$Silke_M3d_HT_3_A2G$Ranges_coord),
+                          ΔRRM_r4 = unique(ΔRRM_list$Silke_M3d_HT_4_A2G$Ranges_coord))
+
+plot_reproducible_upset(ΔRRM_upsetlist, "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/ΔRRM_HT_upset.png", "Shared editing sites (M3d_HT)")
+```
+
+```{r}
+reproducible_events <- function(df) {
+  
+  df_reproducible <- df[df$Frequency >= 2,]
+  
+  return(df_reproducible)}
+
+ADARctrl_reproducible <- reproducible_events(ADARctrl_scores_count) 
+MATR3_wt_reproducible <- reproducible_events(MATR3_wt_scores_count)
+ΔRRM_reproducible <- reproducible_events(ΔRRM_scores_count)
+
+reprod_list <- list(
+  ADARctrl = ADARctrl_reproducible,
+  MATR3 = MATR3_wt_reproducible,
+  ΔRRMctrl = ΔRRM_reproducible
+)
+```
+
+# MATR3 with editing % < 5 reproducibility
+```{r}
+# use coverage-filtered object before edit cutoff
+MATR3_c5_list <- df_list_tc5[grep("Silke_M3_HT_", names(df_list_tc5))]
+
+# Keep unique genomic sites per replicate, then split by score
+MATR3_c5_list_e4 <- purrr::imap(MATR3_c5_list, ~{
+  as.data.frame(.x) %>%
+    dplyr::select(Ranges_coord, score) %>%
+    group_by(Ranges_coord) %>%
+    summarise(score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+    filter(score < 5) %>%
+    mutate(rep = paste0("rep", gsub("Silke_M3_HT_|_A2G", "", .y)))
+})
+
+MATR3_c5_e4_upsetlist <- list(
+        MATR3_r1 = unique(MATR3_c5_list_e4$Silke_M3_HT_1_A2G$Ranges_coord),
+        MATR3_r2 = unique(MATR3_c5_list_e4$Silke_M3_HT_2_A2G$Ranges_coord),
+        MATR3_r3 = unique(MATR3_c5_list_e4$Silke_M3_HT_3_A2G$Ranges_coord),
+        MATR3_r4 = unique(MATR3_c5_list_e4$Silke_M3_HT_4_A2G$Ranges_coord))
+
+# Prepare list for UpSetR
+MATR3_c5_e4_upset <- fromList(MATR3_c5_e4_upsetlist)
+
+#WT_upset_filtered <- WT_upset[rowSums(WT_upset) >= 2, ]
+
+png(
+  filename = "MATR3_c5_e4_upset.png",
+  width = 2400,
+  height = 1800,
+  res = 300,
+  bg = "white")
+
+upset(
+  MATR3_c5_e4_upset,
+  nsets = length(MATR3_c5_e4_upsetlist), 
+  order.by = "freq",
+  mainbar.y.label = "Shared editing sites (MATR3_HT)",
+  sets.x.label = "Editing sites/  Replicate",
+  sets.bar.color = "#08306B",
+  main.bar.color = "#6785AB",
+  text.scale = c(1.2, 1.2, 1, 1, 1, 1)
+)
+
+dev.off()
+```
+
+
+# Count events after each cut-off 
+```{r}
+count_events <- function(gr_list, condition_map) {
+  
+count_events <- data.frame(
+    Condition = character(),
+    Total_unique_events = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+for (cond in unique(condition_map)) {
+    reps <- names(condition_map[condition_map == cond])
+    combined_before <- data.frame()
+    
+    for (rep in reps) {
+      gr <- gr_list[[rep]]
+      df <- as.data.frame(gr)
+      combined_before <- dplyr::bind_rows(combined_before, df)
+    }
+    
+    # Count unique sites (based on Ranges_coord)
+    Total_unique_events <- dplyr::n_distinct(combined_before$Ranges_coord)
+    
+    # Store results
+    count_events <- rbind(count_events, data.frame(
+      Condition = cond,
+      Total_unique_events = Total_unique_events
+    ))
+  }
+  
+  return(count_events)
+}
+
+reprod_conds <- c("ADARctrl" = "ADARcontrol",
+                  "MATR3" = "MATR3",
+                  "ΔRRMctrl" = "ΔRRMcontrol")
+                  
+total_counts <- count_events(gr_list, condition_map)
+
+# calculate all events after 1st cutoff
+counts_after_tc5 <- count_events(df_list_tc5, condition_map)
+
+# editing cutoffs ≥5%
+counts_after_e5 <- count_events(df_list_tc5_e5, condition_map)
+
+# reprod cutoff ≥2 replicates 
+counts_after_r2 <- count_events(reprod_list, reprod_conds)
+
+HT_colors <- setNames(
+  c("#BD241EFF", "#F5B355", "cornflowerblue"),
+  c("ADARcontrol", "MATR3", "ΔRRMcontrol")
+)
+```
+
+```{r}
+total_counts <- count_events(gr_list, condition_map)
+
+# calculate all events after 1st cutoff
+counts_after_tc5 <- count_events(df_list_tc5, condition_map)
+
+# editing cutoffs ≥5%
+counts_after_e5 <- count_events(df_list_tc5_e5, condition_map)
+
+# reprod cutoff ≥2 replicates 
+counts_after_r2 <- count_events(reprod_list, reprod_conds)
+```
+
+```{r}
+barplot_count <- bind_rows(
+  total_counts     %>% mutate(Stage = "No cutoff"),
+  counts_after_tc5 %>% mutate(Stage = "Coverage ≥ 5"),
+  counts_after_e5  %>% mutate(Stage = "Score ≥ 5%"),
+  counts_after_r2  %>% mutate(Stage = "≥ 2 replicates")
+)
+
+barplot_count$Stage <- factor(
+  barplot_count$Stage,
+  levels = c(
+    "No cutoff",
+    "Coverage ≥ 5",
+    "Score ≥ 5%",
+    "≥ 2 replicates"
+  )
+)
+
+barplot_count$Condition <- factor(
+  barplot_count$Condition,
+  levels = cond_order
+)
+
+compare_cutoff <- ggplot(
+  barplot_count,
+  aes(x = Condition, y = Total_unique_events, fill = Stage)
+) +
+  geom_bar(
+    stat = "identity",
+    position = "dodge",
+    width = 0.8
+  ) +
+  geom_text(
+    aes(label = scales::comma(Total_unique_events)),
+    position = position_dodge(width = 0.9),
+    vjust = 0,
+    hjust = 0,
+    size = 5.5,
+    angle = 65
+  ) +
+  scale_fill_manual(values = c(
+    "No cutoff" = "#9E9E9E",
+    "Coverage ≥ 5" = "#08306B",
+    "Score ≥ 5%" = "#6785AB",
+    "≥ 2 replicates" = "#96AFCB"
+  )) +
+  scale_y_continuous(
+    limits = c(0, max(barplot_count$Total_unique_events) * 1.4)
+  ) +
+  theme_bw(base_size = 15) +
+  labs(
+    title = "Editing sites retained across sequential filtering",
+    x = "",
+    y = "Number of editing sites",
+    fill = "Filtering step"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14),
+    legend.position = "right",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14)
+  )
+
+save_thesis_plot(
+  compare_cutoff,
+  filename = "cutoff_comparison_barplot.png",
+  width = 8.5,
+  height = 6
+)
+
+compare_cutoff
+```
+
+# Remove sites look alike background noise to collect high confident sites
+The negative control (no MATR3) captures non-specific signal (background): mapping artifacts, sequencing errors, contaminating gDNA, or editing triggered by Hypertribe. If a site appears robustly in the negative control, it’s likely not specifically induced by MATR3. Therefore, removing negative-control and overlapping among negative control and WT and dRRM sites reduces false positives.
+```{r}
+ggven_reproducible_events <- list(
+  ADARcontrol = ADARctrl_reproducible$Ranges_coord, 
+  MATR3_wt = MATR3_wt_reproducible$Ranges_coord,
+  ΔRRMcontrol = ΔRRM_reproducible$Ranges_coord)
+
+png(
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/reproducible-venndiagram.png",
+  width = 2400,
+  height = 1800,
+  res = 300,
+  bg = "white")
+
+plot(eulerr::euler(ggven_reproducible_events),
+       fills = list(fill = c("#BD241EFF", "#2171B5", "#F5B355"), alpha = 0.5),
+       quantities = TRUE,
+       stroke_size = 1, # control border size
+       set_name_size = 1, # set name size
+       text_size = 2)
+
+dev.off()
+```
+
+
+# Collect high confident events
+Why do we collect DRRM events?
+
+If a site shows up in both WT and dRRM, but not in the negative control, it means:
+Editing at that site depends on MATR3 being present (because it doesn’t happen in negative control without MATR3).
+But it does not depend on the RRM domain specifically, since even without RRM (dRRM mutant), the site is still edited.
+This suggests MATR3 might recruit ADAR to that RNA site through other parts of the protein (like zinc fingers, low-complexity domains, or protein–protein interactions) rather than through its RRM domain.
+```{r}
+custom_colors <- c(
+  "ADARcontrol" = "grey",      
+  "MATR3_wt" = "#2171B5",           # highlight WT unique
+  "ΔRRMcontrol" = "grey",         
+  "ADARcontrol&MATR3_wt" = "grey",
+  "ADARcontrol&ΔRRMcontrol" = "grey",
+  "MATR3_wt&ΔRRMcontrol" = "grey", 
+  "ADARcontrol&MATR3_wt&ΔRRMcontrol" = "grey"
+)
+
+png(
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/threshold_optimize/Matr3-specific-euler.png",
+  width    = 8,
+  height   = 5,
+  units    = "in",
+  res      = 600,
+  bg       = "white"
+)
+
+plot(
+  eulerr::euler(ggven_reproducible_events),
+  
+  fills = list(
+    fill  = custom_colors,
+    alpha = 0.5
+  ),
+  
+  # ── Label sizes ────────────────────────────────────────────────
+  labels = list(
+    fontsize = 16          # set name labels (e.g. "MATR3", "ADAR")
+  ),
+  
+  quantities = list(
+    fontsize = 16,         # ← increase this for overlap numbers
+    fontface = "bold"      # optional: make numbers bold
+  ),
+  
+  stroke_size = 1
+)
+
+dev.off()
+
+```
+
+```{r}
+# Get overlap among all 3 datasets
+overlap_upon_all <- Reduce(intersect, list(ADARctrl_reproducible$Ranges_coord, 
+                                    MATR3_wt_reproducible$Ranges_coord,
+                                    ΔRRM_reproducible$Ranges_coord))
+
+# Remove events belonging to Negative control 
+ADAR_MATR3_overlap <- intersect(ADARctrl_reproducible$Ranges_coord,
+                                  MATR3_wt_reproducible$Ranges_coord)
+
+ADAR_ΔRRM_overlap <- intersect(ADARctrl_reproducible$Ranges_coord,
+                                   ΔRRM_reproducible$Ranges_coord)
+
+```
+
+```{r}
+################################ Overlap upon DRRM and WT
+MATR3_ΔRRM_overlap_only <- setdiff(
+  intersect(MATR3_wt_reproducible$Ranges_coord,
+            ΔRRM_reproducible$Ranges_coord),
+            ADARctrl_reproducible$Ranges_coord)
+
+reprod_MATR3_ΔRRM_df <-  MATR3_wt_reproducible[MATR3_wt_reproducible$Ranges_coord %in% MATR3_ΔRRM_overlap_only, ]
+
+################################ DRRM unique
+reprod_ΔRRM <- setdiff(ΔRRM_reproducible$Ranges_coord, union(ADAR_ΔRRM_overlap, MATR3_ΔRRM_overlap_only))
+
+reprod_uniq_ΔRRM_df <- ΔRRM_reproducible[ΔRRM_reproducible$Ranges_coord %in% reprod_ΔRRM, ]
+
+################################ WT unique
+reprod_MATR3 <- setdiff(MATR3_wt_reproducible$Ranges_coord, union(ADAR_MATR3_overlap, MATR3_ΔRRM_overlap_only)) 
+
+reprod_uniq_MATR3_df <- MATR3_wt_reproducible[MATR3_wt_reproducible$Ranges_coord %in% reprod_MATR3, ]
+
+################################ Negative control unique
+reprod_ADARctrl <- setdiff(ADARctrl_reproducible$Ranges_coord, union(ADAR_MATR3_overlap, ADAR_ΔRRM_overlap))
+
+reprod_uniq_ADAR_df <- ADARctrl_reproducible[ADARctrl_reproducible$Ranges_coord %in% reprod_ADARctrl, ]
+```
+
+
+## Convert high confident site df into GRanges
+```{r}
+df_convert_gr <- function(df) {
+  df2 <- df %>%
+ # Split Ranges_coord into chr and numeric position
+  tidyr::separate(Ranges_coord, into = c("seqnames", "ranges"), sep = "_") %>%
+  mutate(
+    ranges = as.numeric(ranges),
+    score = round(Mean, 2)) %>%
+  dplyr::select(seqnames, ranges, score)
+
+  gr <- makeGRangesFromDataFrame(
+    df2,
+    seqnames.field = "seqnames",
+    start.field    = "ranges",
+    end.field      = "ranges",
+    keep.extra.columns = TRUE)
+  return(gr)}
+############################################ All events 
+ADARctrl_reproducible_gr <- df_convert_gr(ADARctrl_reproducible)
+MATR3_wt_reproducible_gr <- df_convert_gr(MATR3_wt_reproducible)
+ΔRRM_reproducible_gr <- df_convert_gr(ΔRRM_reproducible)
+
+############################################ Reprod events
+reprod_uniq_ΔRRM_gr <- df_convert_gr(reprod_uniq_ΔRRM_df)
+reprod_uniq_MATR3_gr <- df_convert_gr(reprod_uniq_MATR3_df)
+reprod_uniq_ADAR_gr <- df_convert_gr(reprod_uniq_ADAR_df)
+reprod_MATR3_ΔRRM_gr <- df_convert_gr(reprod_MATR3_ΔRRM_df)
+
+# Combine all reproducible GRanges
+m3specific_sites <- reprod_uniq_MATR3_gr
+```
+
+# Which genes that reproducible events occur? 
+```{r}
+annotate_genenames <- function(gr, gns) {
+  
+  hits <- GenomicRanges::findOverlaps(gr, gns, type = "within", ignore.strand = FALSE)
+  gr2 <- gr[queryHits(hits)]
+  strand(gr2) <- strand(gns)[subjectHits(hits)]
+  
+  available_cols <- intersect(c("gene_name", "gene_id", "gene_type", "tag"), colnames(mcols(gns)))
+  
+  mcols(gr2) <- cbind(
+    mcols(gr2),
+    mcols(gns)[subjectHits(hits), available_cols, drop = FALSE]
+  )
+  
+  as.data.frame(gr2) %>%
+    dplyr::select(any_of(c("gene_name", "gene_id", "seqnames", "start", "end", 
+                           "strand", "score", "gene_type", "tag", "region"))) %>%
+    dplyr::distinct()
+}
+
+############## high confident sites
+m3specific_sites2 <- annotate_genenames(m3specific_sites, gns)
+#high_conf_sites2 <- high_conf_sites2 %>%
+#  mutate(GeneID = sub("\\..*", "", gene_id))
+saveRDS(m3specific_sites2, "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/m3specific_sites2.rds")
+```
+
+# Genes of interest
+```{r}
+# Gene of interest
+#mmusculus <- useMart("ENSEMBL_MART_ENSEMBL", dataset="mmusculus_gene_ensembl")
+
+#listFilters(bm)
+#listAttributes(bm)
+
+genes_of_interest <- c(
+  "Rbm20","Matr3","Xist","Ttn","Cacna1a","Cacna1b","Cacna1c","Cacna1d",
+  "Ldb3","Pdlim5","Camk2a","Camk2d","Camk2g","Rbm14","Rbm24","Rbm39",
+  "Rbm8a","Rbpms","Rbpms2","Mbnl1","Mbnl2","Nppa","Nppb","Myh6","Myh7",
+  "Hnrnpu","Srsf3","Tnnt2","Des","Acta1","Actn2","Mybpc1","Mybpc3","Myocd"
+)
+
+collagen_genes <- c(
+  "Col1a1","Col1a2","Col2a1","Col3a1","Col4a1","Col4a2","Col4a3","Col4a4",
+  "Col4a5","Col4a6","Col5a1","Col5a2","Col5a3","Col6a1","Col6a2","Col6a3",
+  "Col6a4","Col6a5","Col6a6","Col7a1","Col8a1","Col8a2","Col9a1","Col9a2",
+  "Col9a3","Col10a1","Col11a1","Col11a2","Col12a1","Col13a1","Col14a1",
+  "Col15a1","Col16a1","Col17a1","Col18a1","Col19a1","Col20a1","Col22a1",
+  "Col23a1","Col24a1","Col25a1","Col26a1","Col27a1","Col28a1","Colgalt1",
+  "Colgalt2","Colq"
+)
+```
+
+
+## Count events per region per dataset
+```{r}
+region_anno_events <- function(gr, regions_list) {
+  
+  # initialize metadata
+  region    <- rep(NA_character_, length(gr))
+  region_id <- rep(NA_character_, length(gr))
+  
+  # loop over regions in GRangesList
+  for (x in names(regions_list)) {
+    hits <- GenomicRanges::findOverlaps(gr, regions_list[[x]], type="any", ignore.strand=FALSE)
+    
+    region[queryHits(hits)[is.na(region[queryHits(hits)])]] <- x
+  }
+  
+  # add metadata back to gr
+  mcols(gr)$region    <- region
+  mcols(gr)$region_id <- region_id
+  
+  return(gr)
+}
+
+################################ high confident sites
+m3specific_sites2_gr <- makeGRangesFromDataFrame(m3specific_sites2,
+    seqnames.field = "seqnames",
+    start.field    = "start",
+    end.field      = "end",
+    keep.extra.columns = TRUE)
+m3specific_sites2_gr_anno    <- region_anno_events(m3specific_sites2_gr, regions_list)
+gns <- region_anno_events(gns, regions_list)
+saveRDS(gns, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/gns_mm39.rds")
+#as.data.frame(high_conf_sites2_gr_anno)
+
+gene_anno <- as.data.frame(gns) %>%
+  dplyr::select(gene_id = gene_id, gene_name = gene_name, gene_type = gene_type) %>%
+  distinct() %>% 
+  mutate(GeneID = sub("\\..*", "", gene_id)) # remove version suffix from gene_id
+saveRDS(gene_anno, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/geneanno_df_mm39.rds")
+```
+
+# Export into bedGraph format for IGV visualization
+```{r}
+seqlevelsStyle(m3specific_sites2_gr_anno) <- "UCSC"
+
+m3specific_sites2_gr_anno_bg <- m3specific_sites2_gr_anno
+start(m3specific_sites2_gr_anno_bg) <- start(m3specific_sites2_gr_anno_bg) - 1
+end(m3specific_sites2_gr_anno_bg)   <- start(m3specific_sites2_gr_anno_bg)       # 1bp
+
+export(m3specific_sites2_gr_anno_bg, con = "/Users/tinkienoob/Master_thesis/MATR3/m3specific_sites.bedGraph", format = "bedGraph")
+```
+
+
+# Create list of control 
+```{r}
+all_control_list <- list(
+  only_ADARctrl = reprod_uniq_ADAR_df, # Background
+  only_ΔRRMctrl = reprod_uniq_ΔRRM_df # Different enrichment, different specificity
+)
+
+############## control annotation function
+control_annotate_func <- function(df, gns, regions_list) {
+
+  gr <- df_convert_gr(df)                 
+  df_gene <- annotate_genenames(gr, gns)  # returns a DF
+
+  gr2 <- makeGRangesFromDataFrame(df_gene,
+    seqnames.field="seqnames", start.field="start", end.field="end",
+    keep.extra.columns=TRUE
+  )
+  GenomeInfoDb::seqlevelsStyle(gr2) <- "UCSC"
+
+  gr2 <- region_anno_events(gr2, regions_list)
+
+  as.data.frame(gr2) %>%
+    mutate(GeneID = sub("\\..*", "", gene_id))
+}
+
+control_anno_gr <- lapply(all_control_list,
+                          control_annotate_func,
+                          gns = gns,
+                          regions_list = regions_list)
+
+saveRDS(control_anno_gr, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/HT_control_list.rds")
+```
+
+# Number of high confident target genes 
+```{r}
+# Count number of high confident editing sites of genes
+m3specific_sites_per_genes <- as.data.frame(m3specific_sites2_gr_anno) %>%
+  group_by(gene_id, gene_name) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  arrange(desc(count)) %>%
+  mutate(
+    Target_genes = case_when(
+      gene_name %in% genes_of_interest ~ "GOI",
+      gene_name %in% collagen_genes ~ "Collagen",
+      TRUE ~ "Other")) 
+    
+# Get TRUE or FALSE if genes are GOI
+m3specific_sites_per_genes2 <- tibble(
+  Target_genes = c("GOI", "Collagen"),
+  Total_target = c(length(genes_of_interest), length(collagen_genes)),
+  highconf_target = c(
+    sum(m3specific_sites_per_genes$gene_name %in% genes_of_interest),
+    sum(m3specific_sites_per_genes$gene_name %in% collagen_genes)
+  )
+)
+
+m3specific_sites_per_genes2_long <- m3specific_sites_per_genes2 %>%
+  mutate(
+    not_included = Total_target - highconf_target
+  ) %>%
+  pivot_longer(cols = c(highconf_target, not_included),
+               names_to = "Status",
+               values_to = "Count") %>%
+  mutate(Status = recode(Status, 
+                         "highconf_target" = "high confident", 
+                         "not_included" = "not included"),
+         Percent = Count / Total_target * 100)
+
+ggplot(m3specific_sites_per_genes2_long, aes(x = Target_genes, y = Percent, fill = Status)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(Percent, 1), "%")), 
+            position = position_stack(vjust = 0.5), size = 5) +
+  labs(
+    title = "Percentage of Target Genes Detected in High-confidence Sites for MATR3",
+    x = "Target gene set",
+    y = "Percentage of genes"
+  ) +
+  scale_fill_manual(values = c("high confident" = "#F5B355", "not included" = "grey")) +
+  theme_minimal(base_size = 10)
+```
+
+
+## Region distribution of Matrin3-specific sites vs. control
+```{r}
+region_colors <- c(
+  "UTR5"   = "#3288BD", 
+  "CDS"    = "#99D594", 
+  "Intron" = "#FDAE61", 
+  "UTR3"   = "#D53E4F", 
+  "Others"  = "#E0E0E0"  # Neutral grey
+)
+# set class order
+class_order <- c("M3-specific", "ADAR specific", "ΔRRM specific")
+# set region order manually if you want full control
+# change this to match your real annotation names exactly
+region_order <- c("UTR5", "CDS", "UTR3", "exon", "Intron", "Others")
+
+# if your region names are different, for example:
+# region_order <- c("five_prime_utr", "cds", "three_prime_utr", "exon", "intron", "Others")
+
+# count number of each region in M3-specific sites
+m3specific_tx_region_counts <- as.data.frame(m3specific_site_gr_anno) %>%
+  mutate(region = ifelse(is.na(region), "Others", region)) %>%
+  group_by(region) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(
+    percentage = count / sum(count) * 100,
+    class = "M3-specific")
+
+# count number of each region in controls
+all_control_region_counts_list <- setNames(
+  lapply(names(all_control_list_HT), function(cond) {
+    df <- all_control_list_HT[[cond]]
+    
+    df %>%
+      mutate(region = ifelse(is.na(region) | region == "", "Others", region)) %>%
+      group_by(region) %>%
+      summarise(count = n(), .groups = "drop") %>%
+      mutate(
+        percentage = count / sum(count) * 100,
+        class = cond
+      )
+  }),
+  names(all_control_list_HT))
+
+all_control_region_counts <- bind_rows(all_control_region_counts_list) %>%
+  mutate(class = recode(
+    class,
+    "only_ADARctrl" = "ADAR specific",
+    "only_ΔRRMctrl" = "ΔRRM specific"
+  ))
+
+# combine
+regions_count_data <- bind_rows(
+  m3specific_tx_region_counts,
+  all_control_region_counts)
+
+# make sure missing regions still appear if absent in some classes
+regions_count_data <- regions_count_data %>%
+  mutate(
+    class = factor(class, levels = class_order),
+    region = ifelse(region %in% region_order, region, "Others"),
+    region = factor(region, levels = region_order)
+  ) %>%
+  arrange(class, region)
+```
+
+
+```{r}
+##################### Stacked barplot
+region_stacked <- ggplot(regions_count_data, aes(x = class, y = percentage, fill = region)) +
+  geom_col(color = "black", linewidth = 0.25, width = 0.6) +
+  geom_text(
+    aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 5.5,
+    fontface = "bold") +
+  scale_fill_manual(values = region_colors, drop = FALSE) +
+  labs(
+    title = "Genomic region distribution",
+    x = NULL, y = "Proportion of editing sites", 
+    fill = "Region") +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14)
+  )
+
+##################### Group barplot
+region_group <- ggplot(regions_count_data, aes(x = class, y = count, fill = region)) +
+  geom_col(
+    color = "black", linewidth = 0.25, width = 0.75,
+    position = position_dodge2(width = 0.8, preserve = "single")) +
+  geom_text(
+    aes(label = count),
+    position = position_dodge2(width = 0.8, preserve = "single"),
+    vjust = -0.4,
+    size = 3) +
+  scale_fill_manual(values = region_colors, drop = FALSE) +
+  labs(
+    title = "Genomic region distribution",
+    x = NULL, y = "Number of editing sites", fill = "Region") +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(face = "bold", size = 12),
+    legend.position = "right") 
+
+# save_thesis_plot(
+#   region_stacked,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "Genomic_region_distribution_stacked.png"),
+#   width = 7.5,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+# 
+# save_thesis_plot(
+#   region_group,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "Genomic_region_distribution_group.png"),
+#   width = 7.5,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+
+region_stacked
+region_group
+```
+
+To answer the question of whether the genomic distribution of high-confidence targets enrich in certain regions due to Matrin3 binding or by chance compared to controls (ADAR random editing sites), we can perform a statistical test such as Fisher's exact test or Chi-squared test. These tests will help us determine if there is a significant association between the class (high-confidence targets vs. controls) and the genomic region distribution.
+
+introns occupy a large fraction of pre-mRNA sequence and are present in the nucleus while transcripts are being processed.
+HyperTRIBE editing happens where the fusion protein (MATR3-ADAR) has access to RNA.
+Pre-mRNA in the nucleus still contains introns.
+Mature cytoplasmic mRNA mostly lacks introns.
+So if most edits are in introns, it supports the idea that a big fraction of editing is happening before splicing, i.e., on nuclear transcripts.
+
+because all your datasets are HyperTRIBE-style editing readouts from the same system/tissue, they share strong global biases:
+introns are long → more chances to hit intronic bases
+coverage/expression drives detection → highly expressed nuclear transcripts dominate
+ADAR has sequence/context preferences that apply in every condition
+
+To answer the question, whether those high confidence editing sites are enriched in intronic region by chance or due to Matrin3 binding, we can compare the proportion of genes with intronic editing sites in the high-confidence gene set vs. a control set (e.g., ADAR control background). We can use a contingency table and perform a Fisher's exact test to see if there is a significant association between being a high-confidence gene and having intronic editing sites.
+
+High-confidence MATR3 target genes are more likely than ADAR background control genes to contain at least one intronic editing site. Compared with ADAR background control genes, high-confidence MATR3 targets showed a higher frequency of genes containing at least one intronic editing site, suggesting that the observed intronic enrichment is unlikely to be explained solely by background ADAR editing.
+
+https://rpkgs.datanovia.com/rstatix/reference/fisher_test.html
+
+
+
+Why? picking the longest transcript per gene, which is a common choice because it covers all exons, UTRs, and possible intronic regions that MATR3 could bind. 
+
+# Number of high confident site in each target genes
+```{r}
+m3specific_sites_per_GOI <- m3specific_sites_per_genes %>%
+  filter(Target_genes %in% c("GOI", "Collagen"))
+
+ggplot(m3specific_sites_per_GOI, aes(x = reorder(gene_name, -count), y = count, fill = Target_genes)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Number of M3-specific editing sites per GOI",
+    x = "Gene",
+    y = "Number of M3-specific editing sites",
+    fill = "Gene set"
+  ) +
+  scale_fill_manual(values = c("GOI" = "#F5B355", "Collagen" = "cornflowerblue")) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, font.size = 0.5))
+```
+
+# GO term analysis of genes containing Matr3-specific sites 
+```{r}
+plot_go_enrichment <- function(ego_obj, set_name, n_terms = 6) {  # remove n_show_genes argument
+  
+  plot_df <- as.data.frame(ego_obj) %>%
+    tidyr::separate(GeneRatio, into = c("gene_count", "bg_count"), sep = "/", convert = TRUE) %>%
+    mutate(
+      GeneRatio_num = gene_count / bg_count,
+      ONTOLOGY = as.character(ONTOLOGY),
+      geneID = as.character(geneID)
+    ) %>%
+    filter(
+      !is.na(GeneRatio_num),
+      is.finite(GeneRatio_num),
+      !is.na(p.adjust),
+      !is.na(Count),
+      !is.na(Description),
+      !is.na(ONTOLOGY)
+    ) %>%
+    group_by(ONTOLOGY) %>%
+    slice_min(p.adjust, n = n_terms, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      term_label = str_wrap(Description, width = 32),
+      
+      # ---- REMOVED: gene_label generation ----
+      
+      ONTOLOGY = dplyr::recode(ONTOLOGY,
+        "BP" = "Biological Process",
+        "CC" = "Cellular Component",
+        "MF" = "Molecular Function"
+      )
+    )
+  
+  plot_df$ONTOLOGY <- factor(plot_df$ONTOLOGY, 
+                              levels = c("Biological Process", 
+                                         "Cellular Component", 
+                                         "Molecular Function"))
+  
+  ggplot(
+    plot_df,
+    aes(
+      x = GeneRatio_num,
+      y = reorder(term_label, GeneRatio_num),
+      color = p.adjust,
+      size = Count)) +
+    geom_point(alpha = 0.6) +
+    facet_grid(ONTOLOGY ~ ., scales = "free_y", space = "free_y") +
+    scale_color_continuous(low = "red", high = "blue", trans = "reverse") +
+    scale_size_continuous(name = "Number of\nMATR3 Targets") + # rename size legend
+    labs(
+      title = paste("Functional Enrichment of Matrin3", set_name, "genes"),
+      x = "Ratio of MATR3 Targets to Total Genes in Term",
+      y = NULL,
+      color = "Adjusted\np-value") +
+    theme_light(base_size = 15) +
+    theme(
+    strip.text   = element_text(size = 18, face = "bold"),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "grey20"),
+    plot.margin = margin(10, 10, 10, 10))  # reduced right margin since no labels
+  
+}
+```
+
+## GO enrichment of genes containing MATR3-specific sites {.tabset}
+```{r}
+# Run GO enrichment separately for each ontology
+ego_m3_specific <- enrichGO(
+  gene          = unique(m3specific_site$GeneID),
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+# Build plots
+ego_m3_specific_plot <- plot_go_enrichment(
+  ego_obj   = ego_m3_specific,
+  set_name  = "specific targets",
+  n_terms   = 8
+)
+
+# # Save each ontology plot as PNG
+# ggsave(
+#   filename = file.path(
+#     "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/GO_MATR3_specific_targets.png"),
+#   plot = ego_m3_specific_plot,
+#   width = 9,
+#   height = 15,
+#   dpi = 600
+# )
+```
+
+## GO enrichment of control-specific sites {.tabset}
+```{r}
+#| results: asis
+control_anno_gr <- lapply(control_anno_gr, function(df) {
+  df %>%
+    mutate(GeneID = sub("\\..*", "", gene_id)) # remove version suffix from gene_id
+})
+
+ctrl_display_names <- c(
+  "only_ADARctrl" = "ADAR specific",
+  "only_ΔRRMctrl" = "ΔRRM specific"
+)
+
+ego_ctrl_list  <- list()
+ego_ctrl_plots <- list()
+
+for (ctrl in names(ctrl_display_names)) {
+
+  display <- ctrl_display_names[[ctrl]]
+  cat("### ", display, "\n\n", sep = "")
+
+  genes_ctrl <- unique(control_anno_gr[[ctrl]]$GeneID)
+  genes_ctrl <- genes_ctrl[!is.na(genes_ctrl) & genes_ctrl != ""]
+
+  ego <- enrichGO(
+    gene          = genes_ctrl,
+    OrgDb         = org.Mm.eg.db,
+    keyType       = "ENSEMBL",
+    ont           = "ALL",
+    pAdjustMethod = "BH",
+    qvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+
+  ego_ctrl_list[[ctrl]] <- ego
+
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    p <- plot_go_enrichment(
+      ego_obj  = ego,
+      set_name = display,
+      n_terms  = 8
+    )
+    ego_ctrl_plots[[ctrl]] <- p
+    print(p)
+
+    # save_thesis_plot(
+    #   p,
+    #   filename = file.path(
+    #     "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png",
+    #     paste0("GO_", gsub(" ", "_", display), ".png")),
+    #   width = 9, height = 15
+    # )
+  } else {
+    cat("No significant GO terms found for", display, "\n\n")
+  }
+
+  cat("\n\n")
+}
+```
+
+# Biotype enrichment of top targets
+```{r}
+highconf_sites_biotype_count <- m3specific_site %>%
+  group_by(gene_type) %>%
+  summarise(n_genes = n(), 
+            .groups = "drop") %>%
+  arrange(desc(n_genes))
+
+ggplot(highconf_sites_biotype_count, aes(x= reorder(gene_type, n_genes), y = n_genes)) +
+  geom_bar(stat = "identity", 
+          fill = "steelblue",
+          alpha = 0.8) + 
+  theme_light(base_size = 14) + 
+  labs(
+    title = "Gene Biotypes among Matrin3-specific targets", 
+    x = "Gene Biotype",
+    y = "Number of genes") + coord_flip()
+```
+
+
