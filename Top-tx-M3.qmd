@@ -1,0 +1,2694 @@
+---
+title: "Find top Matrin3 target transcripts"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+author:
+  - name: "Kim Nguyen"
+format:
+  html:
+    code-fold: TRUE
+    code-overflow: scroll
+    code-summary: "Show code"
+    code-tools: true
+    code-line-numbers: true
+    toc: true
+    toc-depth: 5
+    toc-location: right
+    toc-expand: true
+    number-sections: true
+    theme: sandstone
+    fontsize: 11pt
+    linestretch: 1.5
+    fig-format: png
+    cap-location: margin
+    body-width: 900px
+    sidebar-width: 300px
+    page-layout: full
+    crossref:
+      fig-title: Fig
+    embed-resources: true
+    link-external-newwindow: true
+    smooth-scroll: true
+    css: css.css
+    execute:
+      echo: true
+      warning: false
+editor_options: 
+  chunk_output_type: inline
+---
+
+ The mRNA targets of RBPs were identified using HyperTRIBE. De novo motif discovery analysis was conducted using the XSTREME tool from the MEME suite. Differential gene expression analysis comparing RNA-seq data was performed using DESeq2. The GO term enrichment analysis was carried out using the R package gProfiler2 and visualized with the Cytoscape plugin, EnrichmentMap 
+ 
+# Library
+```{r setup, message=FALSE, warning=FALSE}
+# --- Core Data Manipulation ---
+library(tidyverse)
+library(magrittr)
+library(DT)
+library(kableExtra)
+
+# Bioinformatics & Bioconductor
+library(GenomicRanges)
+library(rtracklayer)
+library(DESeq2)
+library(clusterProfiler)
+library(biomaRt)
+library(org.Mm.eg.db)
+library(Rsamtools)
+library(ggpmisc)
+
+# Visualization
+library(ggrepel)
+library(ggvenn)
+library(eulerr)
+library(patchwork) 
+library(RColorBrewer)
+library(ggpubr)
+library(cowplot)
+library(ggstatsplot)
+
+# --- Path ---
+outpath  <- "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/"
+```
+
+# Load data from previous analysis (M3-specific)
+```{r import-data, message=FALSE, warning=FALSE}
+############## M3-specific sites
+m3specific_site <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/m3specific_sites2.rds") %>%
+  mutate(GeneID = sub("\\..*", "", gene_id)) # remove version suffix from gene_id
+
+############## Annotation
+annoDb <- AnnotationDbi::loadDb("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/annoDb.Db")
+gns    <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/gns_mm39.rds")
+regions_list <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/mm39_region_list.rds")
+gene_anno_df <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/geneanno_df_mm39.rds")
+all_control_list_HT <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/HT_control_list.rds")
+```
+
+
+```{r setup-function, message=FALSE, warning=FALSE}
+# Standardize all plots for your thesis
+theme_thesis <- function(base_size = 16) {
+  theme_bw(base_size = base_size) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = base_size + 2),
+      axis.title = element_text(face = "bold", size = base_size),
+      axis.text = element_text(color = "black", size = base_size - 1),
+      legend.title = element_text(face = "bold", size = base_size - 1),
+      legend.text = element_text(size = base_size - 2),
+      strip.text = element_text(face = "bold", size = base_size - 1)
+    )
+}
+
+# --- Color Palettes ---
+region_colors <- c(
+  "UTR5"   = "#3288BD", 
+  "CDS"    = "#99D594", 
+  "Intron" = "#FDAE61", 
+  "UTR3"   = "#D53E4F", 
+  "Others" = "#E0E0E0"
+)
+
+tier_colors <- c(
+  "Tier1" = "#CD534C", 
+  "Tier2" = "#EFC050", 
+  "Tier3" = "#45B7D1",
+  "Others" = "grey80"
+)
+```
+Genomic ranges: https://biodatascience.github.io/compbio/bioc/ranges.html 
+Because 1 editing site can be annotated to multiple transcripts of the same gene, I will use gene_id as the main identifier for annotation and downstream analysis.
+
+## Genomic features annotation
+### Make annotation database from gtf file
+annotation file is downloaded from: https://www.gencodegenes.org/mouse/release_M37.html
+The gencode.vM37.basic.annotation.gtf file is designed for the mouse genome assembly GRCm39 (mm39). Released around May 2025, this GENCODE dataset (vM37) 
+
+makeTxDbFromGFF builds a structural map including Only the strictly necessary coordinates to define gene structure (Chromosome, Start, End, Strand, IDs)
+while rtracklayer::import reads the full descriptive content in the GTF file (e.g., gene_id, gene_name, gene_biotype, tag) becomes a column in the metadata (mcols).
+
+```{r message=FALSE}
+annoFile = "/Users/tinkienoob/Master_thesis/MATR3/mm39_anno/gencode.vM37.basic.annotation.gtf" 
+
+# Build TxDb from GFF3
+annoDb <- txdbmaker::makeTxDbFromGFF(file = annoFile, format = "gtf")
+
+# Import full annotation for metadata
+annoInfo <- rtracklayer::import(annoFile, format = "gtf")
+
+# Save the TxDb object to file
+AnnotationDbi::saveDb(annoDb, "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/annoDb.Db")
+
+# Extract genes as GRanges
+gns <- genes(annoDb)
+
+# Strip version suffixes from GENCODE IDs (e.g., .18) ---
+#gns$gene_id <- sub("\\..*", "", gns$gene_id)
+#annoInfo$gene_id <- sub("\\..*", "", annoInfo$gene_id)
+
+# Match gene IDs between TxDb and Gtf
+idx <- match(gns$gene_id, annoInfo$gene_id)
+
+# Combine metadata from TxDb + Gtf
+meta <- cbind(elementMetadata(gns),
+              elementMetadata(annoInfo)[idx,])
+meta <- meta[,!duplicated(colnames(meta))]
+
+elementMetadata(gns) <- meta
+```
+## Count events per region per dataset
+```{r}
+region_anno_events <- function(gr, regions_list) {
+  
+  # initialize metadata
+  region    <- rep(NA_character_, length(gr))
+  region_id <- rep(NA_character_, length(gr))
+  
+  # loop over regions in GRangesList
+  for (x in names(regions_list)) {
+    hits <- GenomicRanges::findOverlaps(gr, regions_list[[x]], type="any", ignore.strand=FALSE)
+    
+    region[queryHits(hits)[is.na(region[queryHits(hits)])]] <- x
+  }
+  
+  # add metadata back to gr
+  mcols(gr)$region    <- region
+  mcols(gr)$region_id <- region_id
+  
+  return(gr)
+}
+
+################################ M3-specific sites annotation
+m3specific_site_gr <- makeGRangesFromDataFrame(m3specific_site,
+    seqnames.field = "seqnames",
+    start.field    = "start",
+    end.field      = "end",
+    keep.extra.columns = TRUE)
+m3specific_site_gr_anno <- region_anno_events(m3specific_site_gr, regions_list)
+
+# saveRDS(m3specific_site_gr_anno, "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/m3spec_Granges.rds")
+```
+
+# Calculate Region Lengths per Gene
+```{r}
+# Map lengths to the dataframe, and get gene_id for each transcript
+tx2gene <- AnnotationDbi::select(annoDb, keys = keys(annoDb, "TXNAME"), 
+                                 columns = c("TXNAME", "GENEID"), keytype = "TXNAME") %>%
+  dplyr::rename(tx_name = TXNAME, gene_id = GENEID) %>%
+  filter(!is.na(gene_id))
+
+# CDS
+cds_by_gene <- cdsBy(annoDb, by = "gene")
+cds_reduced <- GenomicRanges::reduce(cds_by_gene)
+cds_len     <- sum(width(cds_reduced)) # Named integer vector by GENEID
+
+# 5' UTR
+utr5_by_gene <- fiveUTRsByTranscript(annoDb, use.names = TRUE)
+utr5_gr      <- unlist(utr5_by_gene)
+utr5_gr$gene_id <- tx2gene$gene_id[match(names(utr5_gr), tx2gene$tx_name)]
+utr5_reduced <- GenomicRanges::reduce(split(utr5_gr, utr5_gr$gene_id))
+utr5_len     <- sum(width(utr5_reduced))
+
+# 3' UTR
+utr3_by_gene <- threeUTRsByTranscript(annoDb, use.names = TRUE)
+utr3_gr      <- unlist(utr3_by_gene)
+utr3_gr$gene_id <- tx2gene$gene_id[match(names(utr3_gr), tx2gene$tx_name)]
+utr3_reduced <- GenomicRanges::reduce(split(utr3_gr, utr3_gr$gene_id))
+utr3_len     <- sum(width(utr3_reduced))
+
+# Introns
+intron_by_gene <- intronsByTranscript(annoDb, use.names = TRUE)
+introns_gr     <- unlist(intron_by_gene)
+introns_gr$gene_id <- tx2gene$gene_id[match(names(introns_gr), tx2gene$tx_name)]
+introns_reduced <- GenomicRanges::reduce(split(introns_gr, introns_gr$gene_id))
+introns_len     <- sum(width(introns_reduced))
+```
+
+# Region length df in gene level 
+```{r}
+# Create a dataframe of all transcript names
+all_genes <- unique(c(names(utr5_len), names(cds_len), names(utr3_len), names(introns_len)))
+
+region_lengths_df <- data.frame(
+  gene_id = all_genes,
+  UTR5 = as.numeric(utr5_len[all_genes]),
+  CDS  = as.numeric(cds_len[all_genes]),
+  UTR3 = as.numeric(utr3_len[all_genes]),
+  Intron = as.numeric(introns_len[all_genes]))
+
+# transpose df 
+region_length_df <- region_lengths_df %>%
+  replace(is.na(.), 0) %>%
+  pivot_longer(cols = c(UTR5, CDS, UTR3, Intron), names_to = "region", values_to = "region_length_kb") %>%
+  mutate(region_length_kb = region_length_kb / 1000) %>%
+  filter(region_length_kb > 0)
+```
+
+
+## Region distribution of Matrin3-specific sites vs. control
+```{r}
+region_colors <- c(
+  "UTR5"   = "#3288BD", 
+  "CDS"    = "#99D594", 
+  "Intron" = "#FDAE61", 
+  "UTR3"   = "#D53E4F"
+)
+
+# set class order
+class_order <- c("M3-specific", "ADAR specific", "ΔRRM specific")
+# set region order manually if you want full control
+# change this to match your real annotation names exactly
+region_order <- c("UTR5", "CDS", "Intron", "UTR3")
+
+m3_region_counts <- as.data.frame(m3specific_site_gr_anno) %>%
+  mutate(
+    region = ifelse(
+      is.na(region) | region == "",
+      "Others",
+      region
+    )
+  ) %>%
+  filter(
+    region %in% c("UTR5", "UTR3", "CDS", "Intron")
+  ) %>%
+  group_by(region) %>%
+  summarise(
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    percentage = count / sum(count) * 100,
+    class = "M3-specific"
+  )
+
+control_region_counts <- bind_rows(
+
+  lapply(names(all_control_list_HT), function(cond) {
+
+    df <- all_control_list_HT[[cond]]
+
+    df %>%
+      mutate(
+        region = ifelse(
+          is.na(region) | region == "",
+          "Others",
+          region
+        )
+      ) %>%
+      filter(
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")
+      ) %>%
+      group_by(region) %>%
+      summarise(
+        count = n(),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        percentage = count / sum(count) * 100,
+        class = cond
+      )
+
+  })
+
+) %>%
+  mutate(
+    class = recode(
+      class,
+      "only_ADARctrl" = "ADAR specific",
+      "only_ΔRRMctrl" = "ΔRRM specific"
+    )
+  )
+
+regions_count_data <- bind_rows(
+  m3_region_counts,
+  control_region_counts
+)
+
+regions_count_data <- regions_count_data %>%
+  mutate(
+    class = factor(
+      class,
+      levels = class_order
+    ),
+    region = factor(
+      region,
+      levels = region_order
+    )
+  ) %>%
+  arrange(class, region)
+
+region_stacked_raw <- ggplot(
+  regions_count_data,
+  aes(
+    x = class,
+    y = percentage,
+    fill = region
+  )
+) +
+  geom_col(
+    color = "black",
+    linewidth = 0.25,
+    width = 0.6
+  ) +
+  geom_text(
+    aes(
+      label = ifelse(
+        percentage >= 3,
+        paste0(round(percentage, 1), "%"),
+        ""
+      )
+    ),
+    position = position_stack(vjust = 0.5),
+    size = 5.5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = region_colors,
+    drop = FALSE
+  ) +
+  labs(
+    title = "",
+    x = NULL,
+    y = "Proportion of editing sites",
+    fill = "Region"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(
+      size = 13,
+      face = "bold"
+    ),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      size = 14,
+      face = "bold"
+    ),
+    axis.text.y = element_text(size = 14)
+  )
+
+region_stacked_raw
+
+save_thesis_plot(
+  region_stacked_raw,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/Region_distribution_raw.png",
+  width = 7.5,
+  height = 6
+)
+
+```
+
+
+```{r}
+# count number of each region in M3-specific sites
+m3_site_counts <- as.data.frame(m3specific_site_gr_anno) %>%
+  mutate(
+    region = ifelse(
+      is.na(region) | region == "",
+      "Others",
+      region
+    )
+  ) %>%
+  filter(
+    region %in% c("UTR5", "UTR3", "CDS", "Intron")
+  ) %>%
+  group_by(region) %>%
+  summarise(
+    count = n(),
+    .groups = "drop"
+  )
+
+
+m3_genes <- unique(
+  as.data.frame(m3specific_site_gr_anno)$gene_id
+)
+
+m3_region_lengths <- region_length_df %>%
+  filter(
+    gene_id %in% m3_genes,
+    region %in% c("UTR5", "UTR3", "CDS", "Intron")
+  ) %>%
+  group_by(region) %>%
+  summarise(
+    total_region_kb = sum(region_length_kb, na.rm = TRUE),
+    .groups = "drop"
+  ) 
+
+m3specific_region_density <- m3_site_counts %>%
+  left_join(
+    m3_region_lengths,
+    by = "region"
+  ) %>%
+  mutate(
+    editing_density = count / total_region_kb,
+    percentage = editing_density / sum(editing_density) * 100,
+    class = "M3-specific"
+  )
+
+# count number of each region in controls
+control_density_df <- bind_rows(
+
+  lapply(names(all_control_list_HT), function(cond) {
+
+    df <- all_control_list_HT[[cond]]
+
+    site_counts <- df %>%
+      mutate(
+        region = ifelse(
+          is.na(region) | region == "",
+          "Others",
+          region
+        )
+      ) %>%
+      filter(
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")
+      ) %>%
+      group_by(region) %>%
+      summarise(
+        count = n(),
+        .groups = "drop"
+      ) 
+
+
+    genes_in_control <- unique(df$gene_id)
+
+    region_lengths <- region_length_df %>%
+      filter(
+        gene_id %in% genes_in_control,
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")
+      ) %>%
+      group_by(region) %>%
+      summarise(
+        total_region_kb = sum(region_length_kb, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    site_counts %>%
+      left_join(region_lengths, by = "region") %>%
+      mutate(
+        editing_density = count / total_region_kb,
+         percentage = editing_density / sum(editing_density) * 100,
+        class = cond
+      )
+
+  })
+
+) %>%
+  mutate(
+    class = recode(
+      class,
+      "only_ADARctrl" = "ADAR specific",
+      "only_ΔRRMctrl" = "ΔRRM specific"
+    )
+  )
+
+# combine
+m3_region_density_df <- bind_rows(
+  m3specific_region_density,
+  control_density_df
+)
+
+# make sure missing regions still appear if absent in some classes
+m3_region_density_df <- m3_region_density_df %>%
+  mutate(
+    class = factor(class, levels = class_order),
+    region = ifelse(region %in% region_order, region, "Others"),
+    region = factor(region, levels = region_order)
+  ) %>%
+  arrange(class, region)
+```
+
+
+```{r}
+##################### Stacked barplot = normalized_density = editing_density / sum(editing_density)
+region_stacked <- ggplot(m3_region_density_df, aes(x = class, y = editing_density, fill = region)) +
+  geom_col(color = "black", position = "fill", linewidth = 0.25, width = 0.6) +
+  geom_text(
+    aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+    position = position_fill(vjust = 0.5),
+    size = 5.5,
+    fontface = "bold") +
+  scale_fill_manual(values = region_colors, drop = FALSE) +
+  labs(
+    title = "",
+    x = NULL, y = "Proportion of normalized editing density", 
+    fill = "Region") +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14)
+  )
+
+region_stacked
+
+save_thesis_plot(
+  region_stacked,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/Region_distribution.png",
+  width = 7.5, height = 6
+)
+```
+
+```{r fisher-regional-distribution}
+
+# Fisher's exact test: for each region, test whether its proportion of sites
+# differs between M3-specific (Tier 1) and each comparison group (Tier 2, Tier 3).
+# 2x2 table per region per comparison:
+#               | in region | not in region |
+#   M3-specific |     a     |       b       |
+#   Group G     |     c     |       d       |
+
+regions_of_interest <- c("UTR5", "UTR3", "CDS", "Intron")
+
+# Helper: get per-region raw counts from a data frame
+get_region_counts <- function(df) {
+  df %>%
+    mutate(region = ifelse(is.na(region) | region == "", "Others", region)) %>%
+    filter(region %in% regions_of_interest) %>%
+    count(region, name = "n") %>%
+    complete(region = regions_of_interest, fill = list(n = 0))
+}
+
+# Tier 1 counts
+tier1_counts <- get_region_counts(as.data.frame(m3specific_site_gr_anno))
+tier1_total  <- sum(tier1_counts$n)
+
+# Comparison groups: Tier 2 (ADAR-specific) and Tier 3 (ΔRRM-specific)
+comparison_groups <- list(
+  "Tier2 (ADAR specific)"  = all_control_list_HT[["only_ADARctrl"]],
+  "Tier3 (ΔRRM specific)"  = all_control_list_HT[["only_ΔRRMctrl"]]
+)
+
+# Run 2x2 Fisher test for each region × comparison group
+fisher_results <- lapply(names(comparison_groups), function(grp_name) {
+
+  grp_counts <- get_region_counts(comparison_groups[[grp_name]])
+  grp_total  <- sum(grp_counts$n)
+
+  lapply(regions_of_interest, function(reg) {
+
+    a <- tier1_counts$n[tier1_counts$region == reg]       # Tier1 in region
+    b <- tier1_total - a                                   # Tier1 not in region
+    c <- grp_counts$n[grp_counts$region == reg]            # Group in region
+    d <- grp_total - c                                     # Group not in region
+
+    tbl <- matrix(c(a, b, c, d), nrow = 2, byrow = TRUE,
+                  dimnames = list(
+                    c("M3-specific", grp_name),
+                    c("in_region", "not_in_region")
+                  ))
+
+    ft <- fisher.test(tbl)
+
+    data.frame(
+      region     = reg,
+      comparison = paste0("M3-specific vs ", grp_name),
+      count_M3   = a,
+      count_grp  = c,
+      odds_ratio = ft$estimate,
+      p_value    = ft$p.value
+    )
+  }) %>% bind_rows()
+
+}) %>% bind_rows()
+
+# BH correction across all tests
+fisher_results <- fisher_results %>%
+  mutate(
+    p_adj        = p.adjust(p_value, method = "BH"),
+    significance = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  ) %>%
+  arrange(comparison, region)
+
+print(fisher_results)
+```
+
+# GO term analysis of genes containing Matr3-specific sites
+```{r}
+plot_go_enrichment <- function(ego_obj, set_name, n_terms = 6) {  # remove n_show_genes argument
+  
+  plot_df <- as.data.frame(ego_obj) %>%
+    tidyr::separate(GeneRatio, into = c("gene_count", "bg_count"), sep = "/", convert = TRUE) %>%
+    mutate(
+      GeneRatio_num = gene_count / bg_count,
+      ONTOLOGY = as.character(ONTOLOGY),
+      geneID = as.character(geneID)
+    ) %>%
+    filter(
+      !is.na(GeneRatio_num),
+      is.finite(GeneRatio_num),
+      !is.na(p.adjust),
+      !is.na(Count),
+      !is.na(Description),
+      !is.na(ONTOLOGY)
+    ) %>%
+    group_by(ONTOLOGY) %>%
+    slice_min(p.adjust, n = n_terms, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      term_label = str_wrap(Description, width = 32),
+      
+      # ---- REMOVED: gene_label generation ----
+      
+      ONTOLOGY = dplyr::recode(ONTOLOGY,
+        "BP" = "Biological Process",
+        "CC" = "Cellular Component",
+        "MF" = "Molecular Function"
+      )
+    )
+  
+  plot_df$ONTOLOGY <- factor(plot_df$ONTOLOGY, 
+                              levels = c("Biological Process", 
+                                         "Cellular Component", 
+                                         "Molecular Function"))
+  
+  ggplot(
+    plot_df,
+    aes(
+      x = GeneRatio_num,
+      y = reorder(term_label, GeneRatio_num),
+      color = p.adjust,
+      size = Count)) +
+    geom_point(alpha = 0.6) +
+    facet_grid(ONTOLOGY ~ ., scales = "free_y", space = "free_y") +
+    scale_color_continuous(low = "red", high = "blue", trans = "reverse") +
+    scale_size_continuous(name = "Number of\nMATR3 Targets") + # rename size legend
+    labs(
+      title = paste("Functional Enrichment of Matrin3", set_name, "genes"),
+      x = "Ratio of MATR3 Targets to Total Genes in Term",
+      y = NULL,
+      color = "Adjusted\np-value") +
+    theme_light(base_size = 19) +
+    theme(
+    strip.text   = element_text(size = 20, face = "bold"),
+    axis.title = element_text(face = "bold", size = 20),
+    axis.text.x = element_text(color = "black", size = 18),
+    axis.text.y = element_text(color = "black", size = 20),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 18),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "grey20"),
+    plot.margin = margin(10, 10, 10, 10))  # reduced right margin since no labels
+  
+}
+```
+
+## GO enrichment of genes containing MATR3-specific sites {.tabset}
+```{r}
+# Run GO enrichment separately for each ontology
+ego_m3_specific <- enrichGO(
+  gene          = unique(m3specific_site$GeneID),
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+# Build plots
+ego_m3_specific_plot <- plot_go_enrichment(
+  ego_obj   = ego_m3_specific,
+  set_name  = "specific targets",
+  n_terms   = 7
+)
+
+# # Save each ontology plot as PNG
+ggsave(
+  filename = file.path(
+    "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/GO_MATR3_specific_targets.png"),
+  plot = ego_m3_specific_plot,
+  width = 11,
+  height = 13,
+  dpi = 600
+)
+```
+
+## Overlap with APPRIS Transcripts
+APPRIS selects a single CDS variant for each gene as the 'PRINCIPAL' isoform based on the range of protein features: https://appris.bioinfo.cnio.es/#/downloads. 
+
+Why APPRIS principal 1? A transcript is tagged PRINCIPAL:1 if it has the strongest structural evidence, regardless of what the other transcripts of the same gene are.
+PRINCIPAL:1 = very strong evidence
+PRINCIPAL:2 = strong
+PRINCIPAL:3 = moderate
+PRINCIPAL:4 = weak
+PRINCIPAL:5 = very weak / default
+But all PRINCIPAL:1–5 are still considered the “main isoform” for that gene.
+```{r}
+appris_anno <- read.table("/Users/tinkienoob/Master_thesis/MATR3/mm39_anno/appris_data_principal_m39.txt", 
+                          header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+
+appris_anno <- appris_anno %>%
+  rename(
+    gene_name = V1,
+    gene_id = V2,
+    tx_id = V3,
+    appris_class = V4,
+    appris_tag = V5) 
+
+appris_only_principal <- appris_anno %>%
+  filter(grepl("PRINCIPAL", appris_tag)) 
+
+```
+
+* Overlap APPRIS principal transcripts with M3-specific targets
+```{r}
+# Get all transcripts with gene_id and tx_id for overlap
+all_transcripts <- transcripts(annoDb, columns = c("tx_name", "gene_id")) 
+
+# remove version suffix from tx_name to match APPRIS tx_id
+all_transcripts$tx_id <- sub("\\..*", "", all_transcripts$tx_name)
+
+overlap_hits <- GenomicRanges::findOverlaps(
+  query = m3specific_site_gr, 
+  subject = all_transcripts, 
+  type = "any", 
+  ignore.strand = FALSE
+)
+
+# Extract the specific transcript IDs that overlap your editing sites
+m3spec_tx_ids <- all_transcripts$tx_id[subjectHits(overlap_hits)]
+```
+
+```{r}
+## Get principal isoform 
+principal_m3spec_sets <- list(
+  Principal_isoforms = unique(appris_only_principal$tx_id),
+  Matr3_specific_targets = unique(m3spec_tx_ids))
+
+png(
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/APPRIS_overlap_M3.png",
+  width    = 8,
+  height   = 5,
+  units    = "in",
+  res      = 600,
+  bg       = "white")
+
+plot(
+  eulerr::euler(principal_m3spec_sets),
+  
+  fills = list(
+    fill  = c("grey", "#2171B5"),
+    alpha = 0.5),
+  
+  labels = list(
+    fontsize = 18,
+    fontface = "bold"),
+  
+  quantities = list(
+    fontsize = 18,
+    fontface = "bold",
+    col      = "black"),
+  
+  stroke_size = 1.5)
+
+dev.off()
+
+plot(
+  eulerr::euler(principal_m3spec_sets),
+  
+  fills = list(
+    fill  = c("grey", "#2171B5"),
+    alpha = 0.5),
+  
+  labels = list(
+    fontsize = 18,
+    fontface = "bold"),
+  
+  quantities = list(
+    fontsize = 18,
+    fontface = "bold",
+    col      = "black"),
+  
+  stroke_size = 1.5)
+```
+
+```{r}
+# Overlapping genes between APPRIS principal genes and MATR3-specific targets
+overlap_principal_tx <- intersect(
+  appris_only_principal$tx_id,
+  unique(m3spec_tx_ids))
+
+# Count how many overlapping genes belong to p:1, p:2, p:3, p:4
+overlap_appris_count <- appris_only_principal %>%
+  filter(tx_id %in% overlap_principal_tx) %>%
+  mutate(
+    principal_group = case_when(
+      str_detect(appris_tag, "PRINCIPAL:1") ~ "P:1",
+      str_detect(appris_tag, "PRINCIPAL:2") ~ "P:2",
+      str_detect(appris_tag, "PRINCIPAL:3") ~ "P:3",
+      str_detect(appris_tag, "PRINCIPAL:4") ~ "P:4",
+      TRUE ~ "other")) %>%
+  filter(principal_group %in% c("P:1", "P:2", "P:3", "P:4")) %>%
+  dplyr::distinct(tx_id, principal_group) %>%   # avoid counting same gene twice
+  dplyr::count(principal_group)
+
+overlap_appris_count
+
+overlap_principal_genes <- appris_only_principal %>%
+  filter(tx_id %in% overlap_principal_tx)
+
+overlap_appris_count <- overlap_principal_genes %>%
+  mutate(
+    principal_group = case_when(
+      str_detect(appris_tag, "PRINCIPAL:1") ~ "P:1",
+      str_detect(appris_tag, "PRINCIPAL:2") ~ "P:2",
+      str_detect(appris_tag, "PRINCIPAL:3") ~ "P:3",
+      str_detect(appris_tag, "PRINCIPAL:4") ~ "P:4",
+      TRUE ~ "other"
+    )
+  ) %>%
+  filter(principal_group %in% c("P:1", "P:2", "P:3", "P:4")) %>%
+  dplyr::distinct(tx_id, principal_group) %>%  
+  dplyr::count(principal_group)
+
+# Plot the distribution
+appris_dis <- ggplot(overlap_appris_count, aes(x = principal_group, y = n, fill = principal_group)) +
+  geom_col(width = 0.7, color = "black", size = 0.3) +
+  geom_text(aes(label = n), vjust = -0.5, size = 5, fontface = "bold") +
+  scale_x_discrete(limits = c("P:1", "P:2", "P:3", "P:4")) +
+  scale_fill_brewer(palette = "Blues") + # A clean palette for thesis figures
+  labs(
+    title = "",
+    x = "",
+    y = "Number of transcripts"
+  ) +
+  theme_thesis() +
+  coord_cartesian(ylim = c(0, max(overlap_appris_count$n) * 1.15)) + # Dynamically scale Y-axis
+  theme(legend.position = "none") # Legend is redundant here
+
+save_thesis_plot(
+  appris_dis,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/APPRIS_pc_distribution.png",
+  width = 6, height = 6
+)
+
+appris_dis
+```
+
+
+```{r}
+# appris_dis <- ggplot(overlap_appris_count, aes(x = principal_group, y = n, fill = principal_group)) +
+#   geom_col(width = 0.7) +
+#   geom_text(aes(label = n), vjust = -0.3, size = 5, fontface = "bold") +
+#   scale_x_discrete(limits = c("P:1", "P:2", "P:3", "P:4")) +
+#   labs(
+#     title = "",
+#     x = "",
+#     y = "Number of transcripts") +
+#   theme_bw(base_size = 18) +
+#   theme_thesis() +
+#   coord_cartesian(ylim = c(0, 8500))
+# 
+# # save_thesis_plot(
+# #   appris_dis,
+# #   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+# #                        "APPRIS_pc_distribution.png"),
+# #   width = 6,
+# #   height = 6,
+# #   dpi = 300,
+# #   bg = "white")
+# appris_dis
+```
+
+```{r region-length-principal-isoforms}
+# Claude generated
+# Re-derive region lengths using only APPRIS principal isoform transcripts
+# from overlap_principal_tx (transcript-level, not gene-level union across all isoforms).
+# Produces region_length_df_principal in the same long format as region_length_df.
+
+# Strip version suffix helper
+strip_ver <- function(x) sub("\\..*", "", x)
+
+# Get per-transcript lengths from a GRangesList (indexed by tx_name with version)
+get_tx_lengths <- function(grl, keep_tx_ids) {
+  keep_idx <- strip_ver(names(grl)) %in% keep_tx_ids
+  grl_filt <- grl[keep_idx]
+  lens     <- sum(width(grl_filt))
+  data.frame(
+    tx_id_stripped = strip_ver(names(lens)),
+    length_bp      = as.numeric(lens),
+    stringsAsFactors = FALSE
+  )
+}
+
+# tx2gene with version-stripped tx_id for joining
+tx2gene_stripped <- tx2gene %>%
+  mutate(tx_id_stripped = strip_ver(tx_name))
+
+# Attach gene_id and keep the longest principal tx per gene
+to_gene_level <- function(df) {
+  df %>%
+    left_join(tx2gene_stripped %>% select(tx_id_stripped, gene_id),
+              by = "tx_id_stripped") %>%
+    filter(!is.na(gene_id)) %>%
+    group_by(gene_id) %>%
+    slice_max(length_bp, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+utr5_pr   <- get_tx_lengths(utr5_by_gene,   overlap_principal_tx) %>% to_gene_level()
+utr3_pr   <- get_tx_lengths(utr3_by_gene,   overlap_principal_tx) %>% to_gene_level()
+intron_pr <- get_tx_lengths(intron_by_gene, overlap_principal_tx) %>% to_gene_level()
+
+# CDS is gene-level (cdsBy by="gene"); filter to principal genes
+principal_gene_ids <- appris_only_principal %>%
+  filter(tx_id %in% overlap_principal_tx) %>%
+  pull(gene_id) %>%
+  unique()
+
+all_pr_genes <- unique(c(utr5_pr$gene_id, utr3_pr$gene_id,
+                          intron_pr$gene_id, principal_gene_ids))
+
+region_length_df_principal <- data.frame(
+  gene_id = all_pr_genes,
+  UTR5    = utr5_pr$length_bp[match(all_pr_genes,   utr5_pr$gene_id)],
+  CDS     = as.numeric(cds_len[all_pr_genes]),
+  UTR3    = utr3_pr$length_bp[match(all_pr_genes,   utr3_pr$gene_id)],
+  Intron  = intron_pr$length_bp[match(all_pr_genes, intron_pr$gene_id)],
+  stringsAsFactors = FALSE
+) %>%
+  replace(is.na(.), 0) %>%
+  pivot_longer(cols = c(UTR5, CDS, UTR3, Intron),
+               names_to  = "region",
+               values_to = "region_length_kb") %>%
+  mutate(region_length_kb = region_length_kb / 1000) %>%
+  filter(region_length_kb > 0)
+```
+
+
+# Define different metrics to evaluate the top targets
+## Transcript length (from annotation)
+```{r}
+# Make a gene length df from gns annotation
+gene_length_df <- data.frame(
+  gene_id = names(gns),
+  gene_length_kb = width(gns)/ 1000 
+)
+
+# Add gene length info into main df: 
+m3specific_site <- m3specific_site %>%
+  left_join(gene_length_df, by = "gene_id") %>%
+  mutate(GeneID = sub("\\..*", "", gene_id))
+
+# Get transcript length from range of transcripts
+transcripts_id <- transcripts(annoDb, columns = c("tx_name", "gene_id"))
+seqlevelsStyle(transcripts_id) <- "UCSC"
+
+transcripts_df <- as.data.frame(transcripts_id)
+
+transcripts_df$gene_id <- as.character(unlist(transcripts_df$gene_id))
+
+transcripts_df <- transcripts_df %>%
+  mutate(tx_length = width)  # width is GRanges width
+
+# Keep the longest transcript per gene
+longest_transcripts <- transcripts_df %>%
+  group_by(gene_id) %>%
+  slice_max(order_by = tx_length, n = 1) %>%  # only choose longest transcript per 1 gene
+  ungroup() %>% 
+  mutate(GeneID = sub("\\..*", "", gene_id)) # remove version suffix from gene_id
+```
+
+## Transcript length distribution
+```{r}
+ggplot(m3specific_site, aes(x = gene_length_kb)) +
+  geom_histogram(
+    binwidth = 50, 
+    fill = "#4C78A8", 
+    color = "black", 
+    alpha = 0.7) +
+  theme_light(base_size = 14) +
+  labs(
+    title = "Transcript Length of MATR3-specific targets Distribution",
+    x = "Transcript Length (kb)",
+    y = "Number of transcripts") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## The longest high confidence transcripts
+```{r eval = FALSE}
+# remove suffix
+longest_transcripts <- longest_transcripts %>%
+  mutate(tx_id = sub("\\..*", "", tx_name))
+
+longest_highconf_sets <- list(
+  Longest_Transcripts = unique(longest_transcripts$tx_id),
+  Matr3_specific_targets = unique(m3spec_tx_ids))
+
+plot(eulerr::euler(longest_highconf_sets),
+       fills = list(fill = c("#BD241EFF", "#F5B355"), alpha = 0.5),
+       quantities = TRUE,
+       stroke_size = 1, # control border size
+       set_name_size = 1, # set name size
+       text_size = 2)
+
+######################## collect longest high confidence transcripts 
+longest_highconf_tx <- intersect(unique(longest_transcripts$gene_id),
+                                 unique(m3spec_tx_ids)
+
+```
+
+
+
+```{r}
+######################## collect principal high confidence transcripts 
+principal_m3_tx <- intersect(unique(appris_only_principal$gene_id), 
+                                   unique(m3specific_site$GeneID))
+
+principal_m3_tx_df <- m3specific_site %>%
+  group_by(GeneID) %>%
+  filter(GeneID %in% principal_m3_tx)
+
+# saveRDS(principal_m3_tx_df, file = "/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/matr3_principal_iso.rds")
+```
+
+
+## Number of editing sites in each gene
+```{r}
+site_counts_df <- m3specific_site %>%
+  group_by(gene_id) %>%
+  summarise(
+    n_sites = n(),
+   .groups = "drop"  # removes the extra message
+  ) %>%
+  left_join(gene_length_df %>% 
+            dplyr::select(gene_id, gene_length_kb) %>%
+            distinct(),
+            by = "gene_id") %>%
+  arrange(desc(n_sites))
+
+ggplot(site_counts_df, aes(n_sites)) +
+  geom_histogram(binwidth = 2,
+                 fill = "#4C78A8", 
+                color = "black", 
+                alpha = 0.7) +
+  labs(
+    title = "Number of editing sites/ a gene",
+    x = "Number of editing sites",
+    y = "Number of genes") +
+  coord_cartesian(xlim = c(0,50)) +
+  theme_light(base_size = 14)
+```
+
+
+## Editing site density
+now I have one longest transcript per gene, I use gene length (or the summed exon length of the gene) to normalize editing sites.
+```{r}
+# Calculate number of editing sites per longest transcript/ gene
+sites_per_kb_df <- site_counts_df %>%
+  mutate(sites_per_kb = n_sites / gene_length_kb) %>%
+  filter(!is.na(sites_per_kb), gene_length_kb > 0)
+
+ggplot(sites_per_kb_df, aes(x = sites_per_kb)) +
+  geom_histogram(
+    fill = "#4C78A8",
+    color = "black",
+    alpha = 0.7) +
+  theme_light(base_size = 14) +
+  labs(
+    x = "Number of sites/ kb gene length",
+    y = "Number of genes",
+    title = "Editing site density") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+## Editing scores calculation: mean, median, and max score
+```{r}
+calc_edit_scores <- m3specific_site %>%
+  group_by(gene_id) %>%
+  summarise(
+    mean_editing   = mean(score, na.rm = TRUE),
+    median_editing = median(score, na.rm = TRUE),
+    max_editing    = max(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Median editing % per site
+```{r}
+# Histogram for median editing %
+median_per <- ggplot(calc_edit_scores, aes(x = median_editing)) +
+  geom_histogram(binwidth = 2,
+                 fill = "#4C78A8", 
+                color = "black", 
+                alpha = 0.7) +
+  theme_light() +
+  labs(
+    title = "Histogram of Median Editing %",
+    x = "Median Editing %",
+    y = "Number of genes") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(color = "black", size = 17),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.position = "right"
+  )
+
+median_per
+
+# save_thesis_plot(
+#   median_per,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "Median_editing_distribution.png"),
+#   width = 6,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+```
+
+### Mean editing % per site
+```{r}
+# Histogram for mean editing %
+mean_per <- ggplot(calc_edit_scores, aes(x = mean_editing)) +
+  geom_histogram(binwidth = 2,
+                 fill = "#4C78A8", 
+                color = "black", 
+                alpha = 0.7) +
+  theme_light() +
+  labs(
+    title = "Histogram of Mean Editing %",
+    x = "Mean Editing %",
+    y = "Number of genes") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(color = "black", size = 17),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.position = "right"
+  )
+
+mean_per
+
+# save_thesis_plot(
+#   mean_per,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "Mean_editing_distribution.png"),
+#   width = 6,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+```
+
+### Max Editing % per gene
+```{r}
+max_per <- ggplot(calc_edit_scores, aes(x = max_editing)) +
+  geom_histogram(binwidth = 2,
+                 fill = "#4C78A8", 
+                color = "black", 
+                alpha = 0.7) +
+  theme_light() + 
+  labs(
+    title = "Histogram of Max Editing %",
+    x = "Max Editing %",
+    y = "Number of genes") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(color = "black", size = 17),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.position = "right"
+  )
+
+max_per
+
+# save_thesis_plot(
+#   max_per,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "Max_editing_distribution.png"),
+#   width = 6,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+```
+
+## Expression level computed by TPM
+TPM (Transcripts Per Million) is a within-sample measure of relative transcript abundance.
+If a transcript has many editing sites but also very high TPM, that might be due to transcript high expression, not because MATR3 binds it more specifically.
+* Input htseq count 
+```{r htseq-input, echo=FALSE, message=FALSE, warning=FALSE}
+# Input path
+countFolder_HT <- "/Users/tinkienoob/Master_thesis/MATR3/htseqcount_HT_nonreverse"
+
+list.files(countFolder_HT)
+
+# List all file containing "counts" in the folder
+countFiles_HT <- list.files(countFolder_HT, pattern = "htseq_forward\\.txt$", full.names = TRUE)
+
+# Create sample table/ data frame for DESeq from Htseq-count
+## remove prefix and suffix in htseq output name
+sampleNames_HT <- gsub(".*/Silke_|_dedup_htseq_forward\\.txt$", "", countFiles_HT)
+
+## define how many conditions and replicates for df
+conditions_HT = factor(rep(c("ADARcontrol", "MATR3", "ΔRRMcontrol"), each=4))
+replicates_HT = factor(rep(c("rep1", "rep2", "rep3", "rep4"),3))
+
+sampleTable_HT <- data.frame(
+  sampleName = sampleNames_HT,
+  file = basename(countFiles_HT),
+  condition = conditions_HT,
+  replicate = replicates_HT
+)
+
+####################### Create the DESeqDataSet (without matrix)
+dds_HT <- DESeqDataSetFromHTSeqCount(sampleTable = sampleTable_HT,
+                                 directory = countFolder_HT,
+                                 design = ~ condition)
+
+####################### Running DESeq2 analysis to identify differentially expressed genes
+# Deseq data object 
+dds_HT <- DESeq(dds_HT)
+
+# Save dds outout in the outpath as rds file
+# saveRDS(dds_HT, file = paste0(outpath, "Hypertribe_DESeq2.rds"))
+```
+
+* Get normalized read counts and calculate DESeq2 results
+```{r}
+dds_HT <- readRDS(paste0(outpath, "Hypertribe_DESeq2.rds"))
+# Inspect the sizeFactor
+dds_HT$sizeFactor
+
+# Get read counts
+#A = DESeq2::counts(dds)
+#rownames(A) = sub("\\..*", "", rownames(A))
+
+#Get normalized read counts of dds result
+dds_count_HT <- DESeq2::counts(dds_HT, normalized = TRUE)
+
+# calculate dds result 
+res_HT <- results(dds_HT, alpha = 0.05)
+
+### Information about which variables and tests were used can be found by calling the function mcols on the results object.
+#mcols(res_HT)$description
+```
+
+* Convert dds result into dataframe and add gene_id column for later merging with annotation
+```{r}
+# Convert dds result into dataframe
+res_HT.df <- as.data.frame(res_HT) %>%
+  mutate(GeneID = sub("\\..*", "", rownames(res_HT))) # remove version suffix from gene_id
+```
+
+Source - https://stackoverflow.com/q
+sweep(x, MARGIN, STATS, FUN="-", check.margin=T, ...)
+x is the data
+STATS refers to the summary statistics which you wish to 'sweep out'
+FUN is the function used to carry out the sweep, "-" is the default
+
+```{r}
+################################ get raw count from dds
+counts_raw_HT <- counts(dds_HT, normalized = FALSE)
+
+counts_HT_df <- as.data.frame(counts_raw_HT) %>%
+  tibble::rownames_to_column("gene_id") %>% 
+  mutate(GeneID = sub("\\..*", "", gene_id))
+
+counts_HT_df <- counts_HT_df %>%
+  left_join(gene_length_df, by = "gene_id")
+
+calculateTPM <- function(df) {
+  # only keep raw counts column
+  count_cols <- setdiff(colnames(df), c("gene_id", "GeneID", "gene_length_kb"))
+  
+  # Step 1: Compute RPK per sample
+  df_rpk <- df
+  df_rpk[, count_cols] <- df_rpk[, count_cols] / (df_rpk$gene_length_kb)
+  
+  # Step 2: Compute scaling factors per sample
+  scaling_factors <- colSums(df_rpk[, count_cols], na.rm = TRUE) / 1e6 # Calculate column-wise sum rpk/1e6
+  
+  # Step 3: Compute TPM
+  tpm_matrix <- sweep(df_rpk[, count_cols], 2, scaling_factors, "/") # TPM[i,j] = RPK[i,j] / (sum(RPK[,j])/ 1e6 )
+  
+  # Step 4: Add gene_id back
+  tpm_df <- cbind(gene_id = df$gene_id, as.data.frame(tpm_matrix))
+  
+  return(tpm_df)
+}
+
+TPM_calc <- calculateTPM(counts_HT_df) 
+
+TPM_df <- TPM_calc %>%
+  mutate(
+    Control_meanTPM = rowMeans(dplyr::select(., HT_1:HT_4), na.rm = TRUE),
+    WT_meanTPM = rowMeans(dplyr::select(., M3_HT_1:M3_HT_4), na.rm = TRUE),
+    KD_meanTPM = rowMeans(dplyr::select(., M3d_HT_1:M3d_HT_4), na.rm = TRUE),
+    log10_TPM_WT = log10(WT_meanTPM)) %>%
+  dplyr::select(c("gene_id", "Control_meanTPM", "WT_meanTPM", "KD_meanTPM", "log10_TPM_WT")) %>%
+  left_join(counts_HT_df %>% dplyr::select(gene_id, GeneID, gene_length_kb), by = "gene_id")
+```
+
+
+# Create a table with different features 
+```{r}
+# calculate fraction of sites
+fraction_cal <- m3specific_site %>%
+  group_by(gene_name, gene_id) %>%
+  summarise(
+    n_sites = n(),
+    sites_over10 = sum(score > 10, na.rm = TRUE),
+    fraction_over10 = round((sites_over10 / n_sites), 2) * 100,
+    .groups = "drop"  # ADD THIS
+  )
+
+features_df <- site_counts_df %>%
+  left_join(calc_edit_scores, by = "gene_id") %>% # add editing scores
+  left_join(TPM_df %>% dplyr::select(gene_id, WT_meanTPM, log10_TPM_WT), by = "gene_id") %>% # add TPM and log10(TPM) 
+  left_join(gene_anno_df %>% dplyr::select(gene_id, gene_name), by = "gene_id")  # add gene name
+
+```
+
+## Expression level distribution and cutoff
+```{r}
+TPM_cutoff <- ggplot(features_df, aes(x = log10_TPM_WT)) +
+  geom_histogram(binwidth = 0.1, fill = "#4C78A8", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") + # Cutoff example
+  labs(title = "Distribution of log10(TPM) Expression Levels",
+       x = "log10(TPM)",
+       y = "Number of transcripts") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14)
+  )
+
+TPM_cutoff
+
+# save_thesis_plot(
+#   TPM_cutoff,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "TPM_cutoff_distribution.png"),
+#   width = 6.5,
+#   height = 4,
+#   dpi = 600,
+#   bg = "white")
+```
+Why log10(TPM) > 0? This means TPM > 1, which is a common threshold to consider a gene as "expressed" in the sample.
+
+### Filter out lowly expressed transcripts (log10(TPM) <= -1) to focus on more reliable editing events
+```{r}
+features_df2 <- features_df %>%
+  filter(log10_TPM_WT > 0)
+
+lowexpress_genes <- features_df %>%
+  filter(log10_TPM_WT < 0)
+```
+
+# Scatterplot between gene length and max editing %
+Editing % reflects how efficiently ADAR edits the RNA at that site, which correlates with how stable or strong the RBP–RNA interaction is => Here I would call it editing efficiency 
+High editing % → strong or repeated RBP binding
+Low editing % → weak, transient, or noise.
+
+Mean while editing density (#sites per kb) tells you how many contacts occur.
+filter(log10_TPM_WT > 0) is equivalent to filter(WT_meanTPM > 1)
+
+```{r}
+maxscore_length <- ggplot(features_df2, aes(x = gene_length_kb, y = max_editing)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE) +
+  stat_cor(method = "pearson", size = 6) +
+  theme_bw() +
+  labs(
+   title = "",
+    x = "Gene length (kb)",
+    y = "Maximum Editing %") + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16))+
+  coord_cartesian(xlim = c(0, 500), ylim = c(0, 100))
+
+maxscore_length
+
+save_thesis_plot(
+  maxscore_length,
+  filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+                       "Max_editing_gene_length.png"),
+  width = 6,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+# 
+```
+The cloud is very dense and scattered ("football" shape). The points are not tightly hugging the line. This visually suggests a weaker correlation than the site count plot, even though the line goes up.
+
+# Scatterplot between Max Editing %/ Editing sites
+```{r}
+maxscore_count <- ggplot(features_df2, aes(x = n_sites, y = max_editing)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "blue", fill = "lightblue", alpha = 0.2) +
+  theme_bw() + 
+  stat_cor(method = "pearson", size = 6) +
+  coord_cartesian(xlim = c(0, 90),
+                  ylim = c(0, 100)) +
+  labs(
+    title = "",
+    x = "Number of Editing sites",
+    y = "Maximum Editing %") +
+    theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+maxscore_count
+
+save_thesis_plot(
+  maxscore_count,
+  filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+                       "Max_editing_site_count.png"),
+  width = 6,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+
+```
+
+# Scatterplot between Expression level and Numbers of editing site
+```{r}
+#| echo: true
+tpm_count <- ggplot(features_df2, aes(x = log10_TPM_WT, y = n_sites)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_bw() +
+  labs(
+    title = "",
+    x = "log10(TPM)",
+    y = "Number of Editing Sites") +
+  stat_cor(method = "pearson", size = 6) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+save_thesis_plot(
+  tpm_count,
+  filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+                       "tpm_count.png"),
+  width = 6,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+
+tpm_count
+```
+
+# Scatterplot between Expression level and Max editing %
+```{r}
+tpm_maxedit <- ggplot(features_df2, aes(x = log10_TPM_WT, y = max_editing)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "",
+    x = "log10(TPM)",
+    y = "Maximum Editing %") +
+  theme_bw() + 
+  stat_cor(method = "pearson", size = 6) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+save_thesis_plot(
+  tpm_maxedit,
+  filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+                       "tpm_maxedit.png"),
+  width = 6,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+
+tpm_maxedit
+```
+There is no positive correlation between gene expression and editing efficiency.
+=> Being a highly expressed gene does not make it more likely to be edited or high-efficiency editing.
+
+## Scatterplot between Editing sites/ gene length (kb)
+```{r}
+length_count_w_outlier <- ggplot(features_df2, aes(x = gene_length_kb, y = n_sites)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  # geom_point(data = subset(features_df2, features_df2$gene_length_kb >= quantile(features_df2$gene_length_kb, 0.995)), color = "red", size = 3, alpha = 0.4) + # Highlight outliers in red
+  # geom_point(data = subset(features_df2, features_df2$n_sites >= quantile(features_df2$n_sites, 0.995)), color = "red", size = 3, alpha = 0.4) + # Highlight outliers in red
+  theme_bw() +
+  labs(
+    title = "BEFORE outlier removal",
+    x = "Gene Length (kb)",
+    y = "Number of Editing Sites") +
+  stat_cor(method = "pearson", size = 6) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+length_count_w_outlier
+
+# save_thesis_plot(
+#   length_count_wth_outlier,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "Gene_length_count_before_removal.png"),
+#   width = 6,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+```
+
+# Correcting for Size to Find True Biological Signal
+### Set outlier thresholds
+```{r}
+
+# Check how many outliers at different thresholds
+threshold_comparison <- data.frame()
+
+for(q in c(0.9, 0.95, 0.99, 0.995, 1.0)){
+  
+  length_t <- quantile(features_df2$gene_length_kb, q)
+  editing_t <- quantile(features_df2$n_sites, q)
+  
+  outliers <- features_df2 %>%
+    filter(gene_length_kb >= length_t | n_sites >= editing_t)
+  
+  clean <- features_df2 %>%
+    filter(gene_length_kb < length_t & n_sites < editing_t)
+  
+  # Fit model on clean data
+  model_clean <- lm(n_sites ~ gene_length_kb, data = clean)
+  r2 <- summary(model_clean)$r.squared
+  
+  threshold_comparison <- rbind(threshold_comparison, data.frame(
+    quantile = q,
+    length_cutoff_kb = round(length_t, 1),
+    editing_cutoff = round(editing_t, 0),
+    n_outliers = nrow(outliers),
+    pct_removed = round(nrow(outliers)/nrow(features_df2)*100, 2),
+    r_squared = round(r2, 4)
+  ))
+}
+
+print(threshold_comparison)
+
+# plot_threshold <- function(q) {
+#   length_t  <- quantile(features_df2$gene_length_kb, q, na.rm = TRUE)
+#   editing_t <- quantile(features_df2$n_sites, q, na.rm = TRUE)
+#   
+#   clean <- features_df2 %>%
+#     filter(gene_length_kb < length_t & n_sites < editing_t)
+#   
+#   ggplot(clean, aes(x = gene_length_kb, y = n_sites)) +
+#     geom_point(alpha = 0.6) +
+#     geom_smooth(method = "lm", se = TRUE) +
+#     ggpubr::stat_cor(method = "pearson", size = 5) +
+#     theme_bw() +
+#     labs(
+#       title = paste("After outlier removal: q =", q),
+#       x = "Gene length (kb)",
+#       y = "Number of editing sites"
+#     ) +
+#     theme(
+#       plot.title = element_text(hjust = 0.5, face = "bold"),
+#       axis.title = element_text(face = "bold")
+#     )
+# }
+
+```
+Why don't high editing site counts mean that transcripts are more likely to be potential targets of Matr3? because numbers of editing site are driven by length of genes (the longer the genes, the more opportunities that ADAR enzyme can cause more editing)
+
+```{r}
+# Define 99.5th percentile thresholds
+length_threshold  <- quantile(features_df2$gene_length_kb, 0.995)
+editing_threshold <- quantile(features_df2$n_sites, 0.995)
+
+ggplot(features_df2, aes(x = gene_length_kb, y = n_sites)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_point(data = subset(features_df2, features_df2$gene_length_kb >= length_threshold),
+             color = "red", size = 3, alpha = 0.2) + # Highlight outliers in red
+  geom_point(data = subset(features_df2, features_df2$n_sites >= editing_threshold),
+             color = "red", size = 3, alpha = 0.2) + # Highlight outliers in red
+  labs(
+    title = "AFTER outlier removal",
+    x = "Gene Length (kb)",
+    y = "Number of Editing Sites") +
+  stat_cor(method = "pearson", size = 6) +
+  theme_bw() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+```
+* Fit linear model to predict expected number of editing sites based on gene length
+```{r}
+model_len_sites <- lm(n_sites ~ gene_length_kb, data = features_df2)
+# out: expected sites = 1.22061 + (0.06854 x gene length in kb)
+
+features_df3 <- features_df2 %>%
+  mutate(
+    expected_sites = predict(model_len_sites, newdata = .),
+    # Residual = Actual Length - Expected Length
+    residuals = n_sites - expected_sites
+  ) %>%
+  dplyr::select(c("gene_id", "gene_name", "n_sites", "gene_length_kb", "max_editing", "residuals")) %>%
+  arrange(desc(residuals))
+
+#view(top_target_df2)
+################################## Create new df without outliers for residual values
+upper_outliers <- features_df3 %>%
+  filter(
+    gene_length_kb >= length_threshold |
+    n_sites        >= editing_threshold, 
+    residuals > 0) %>%
+  mutate(outlier_type = "top")
+
+# Collect bottom outliers with extremely low editing site density
+lower_outliers <- features_df3 %>%
+  filter(gene_length_kb >= length_threshold,
+         residuals < 0) %>%
+  mutate(outlier_type = "bot")
+  
+# All outliers with high editing site counts and low editing site counts but long gene length
+outliers_len_sites <- bind_rows(upper_outliers, lower_outliers)
+
+# Collect potential transcripts having high density editing sites
+upper_targets <- features_df3 %>%
+  filter(residuals > 0) %>% 
+  arrange(desc(n_sites))
+
+# Long transcripts below the regression line which have low density editing sites
+lower_targets <- features_df3 %>%
+  filter(residuals <= 0) %>%
+  arrange(desc(n_sites))
+```
+The "big cloud" in the bottom-left corner (short genes, few sites) represents the vast majority of the transcriptome. It is tempting to dismiss them as "background," but they often contain highly specific.
+
+
+* Remove outliers and re-plot the scatterplot to see the true relationship between gene length and editing site number
+```{r}
+#| echo: true
+# Make scatterplot between gene length and editing site number WITHOUT outliers
+m3target_no_outlier_df <- features_df2 %>%
+  filter(gene_length_kb < length_threshold & n_sites < editing_threshold)
+
+length_count_no_outliers <- ggplot(m3target_no_outlier_df,
+       aes(x = gene_length_kb, y = n_sites)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue") +
+  theme_bw() +
+  labs(
+    title = "AFTER outlier removal",
+    x = "Gene Length (kb)",
+    y = "Number of Editing Sites") +
+  stat_cor(method = "pearson", size = 6) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+# save_thesis_plot(
+#   length_count_no_outliers,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "genelng_count_no_outliers.png"),
+#   width = 6,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+
+length_count_no_outliers
+```
+Top outliners = more highly expressed than predicted but poorly edited (because ADAR enzyme is probably less active on them)
+Bot outliner = strongly edited eventhough low expression
+99.5th percentile cutoff means:
+
+upper_outliers = genes with extremely HIGH n_sites 
+               OR extremely LONG transcripts
+               → These are genuine MATR3 targets 
+                 but distort regression line
+               → Should go to Tier 1 or Tier 2 
+                 based on max_editing
+
+lower_outliers = genes with extremely LOW editing density
+               → Very long transcripts with almost no sites
+               → Should go to Tier 3
+               
+* Fit linear model on the clean data without outliers to get expected number of editing sites based on gene length, then calculate residuals to find transcripts with higher or lower editing site density than expected
+```{r}
+clean_model_len_sites <- lm(n_sites ~ gene_length_kb, data = m3target_no_outlier_df)
+
+# Apply the model to the FULL dataset (assuming 'features_df2' is your full dataframe)
+tier_classify_df <- m3target_no_outlier_df %>%
+  mutate(
+    expected_sites = predict(clean_model_len_sites, newdata = m3target_no_outlier_df), # Get expected number of sites based on gene length using the clean model
+    
+    # Residual = Actual Sites - Expected Sites
+    # Positive = denser editing than expected; Negative = sparser editing than expected
+    residuals = n_sites - expected_sites) %>%
+  mutate(
+    # Use case_when to cleanly assign tiers based on your established criteria
+    rank = case_when(
+      residuals > 0 & max_editing >= 50 ~ "Tier 1",
+      residuals > 0 & max_editing < 50  ~ "Tier 2",
+      residuals <= 0 ~ "Tier 3",
+      TRUE ~ "Others")) %>%
+  dplyr::select(gene_id, gene_name, n_sites, gene_length_kb, max_editing, expected_sites, residuals, rank) %>%
+  arrange(desc(residuals))
+
+upper_outliers_classified <- upper_outliers %>%
+  mutate(
+    rank = case_when(
+      max_editing >= 50 ~ "Tier 1",
+      max_editing < 50  ~ "Tier 2"))
+
+lower_outliers_classified <- lower_outliers %>%
+  mutate(rank = "Tier 3")
+
+tier_classify_df <- bind_rows(
+  tier_classify_df,
+  upper_outliers_classified,
+  lower_outliers_classified) %>%
+  distinct(gene_id, .keep_all = TRUE)
+
+
+# Check your distributions to ensure the logic worked as intended
+table(tier_classify_df$rank)
+```
+in short, 
+residuals > 0 & max_editing >= 50 ~ "Tier1"
+residuals > 0 & max_editing < 50  ~ "Tier2"
+residuals < 0 ~ "Tier3"
+
+# Manually move Ttn gene from Tier1 into Tier2 set
+```{r}
+# Manually assign the Ttn gene to Tier 1, overriding the model
+rank_M3tx_manual_df <- tier_classify_df %>%
+  mutate(
+    rank = ifelse(gene_name == "Ttn", "Tier 1", rank)) 
+
+# Check the distribution to make sure Ttn shifted correctly
+table(rank_M3tx_manual_df$rank)
+
+saveRDS(rank_M3tx_manual_df, file = "/Users/tinkienoob/Master_thesis/MATR3/rank_M3_target_manual.rds")
+```
+* Visualize the relationship between gene length and editing site number colored by tier to see how the 3 tiers distribute in the plot
+
+## Scatterplot between length-adjusted residual and max editing % colored by tier to see how the 3 tiers distribute in the plot
+```{r}
+#| echo: true
+
+tier_colors <- c(
+  "Tier 1" = "#CD534C", 
+  "Tier 2" = "#EFC050", 
+  "Tier 3" = "#45B7D1",
+  "Others" = "grey80")
+
+residual_tier <- ggplot(rank_M3tx_manual_df, aes(x = residuals, y = max_editing, color = rank)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_hline(yintercept = 50, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = tier_colors) +
+  stat_quadrant_counts(xintercept = 0, yintercept = 50,
+                       size = 6) +
+  theme_bw() +
+  labs(
+    title = "",
+    x = "Residual (=Actual site counts - Expected site counts)",
+    y = "Maximum Editing %",
+    color = "Tier") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.position = "right")
+```
+
+
+```{r}
+ggplot(tier_classify_df, aes(x = gene_length_kb, y = n_sites, color = rank)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = tier_colors) +
+  theme_bw() +
+  labs(
+    title = "",
+    x = "Gene length (kb)",
+    y = "Number of editing sites",
+    color = "Tier") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.position = "right")
+
+# save with transparent background
+save_thesis_plot(
+  residual_tier,
+  filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+                       "residual_tier.png"),
+  width = 7,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+
+residual_tier
+```
+
+
+
+# Convert into fasta file for XSTREME analysis
+getSeq() then tries to extract sequences for all of them at once, which can exceed R’s recursion/stack limits.
+```{r eval = FALSE}
+library(Rsamtools)
+
+# genome FASTA (downloaded from GENCODE/Ensembl)
+genome_fa_path <- "/Users/tinkienoob/Master_thesis/MATR3/mm39_anno/GRCm39.primary_assembly.genome.fa"
+
+# Create FaFile object for the genome FASTA
+fa <- FaFile(genome_fa_path)
+
+fasta_conversion <- function(reprod_gr, prefix, fa){
+  
+  reprod_gr_resize <- GenomicRanges::resize(reprod_gr, width = 501, fix = "center")
+
+  reprod_seqs <- getSeq(fa, reprod_gr_resize)
+  
+    names(reprod_seqs) <- !duplicated(paste0(
+    prefix, "_",
+    seqnames(reprod_gr_resize), ":",
+    start(reprod_gr_resize), "-",
+    end(reprod_gr_resize), "_",
+    strand(reprod_gr_resize), "_",
+    seq_along(reprod_gr_resize)
+  ))
+
+  writeXStringSet(reprod_seqs, filepath = paste0(prefix, "_es.fasta"))
+}
+
+tier1_gr <- m3specific_site_gr_anno[mcols(m3specific_site_gr_anno)$gene_id %in% tier1_tx$gene_id]
+
+# Load control gr
+specificADAR_control <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/specificADAR_control.rds")
+specificΔRRM_control <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/specificΔRRM_control.rds")
+
+#### tier 1 is high confidence
+fasta_conversion(tier1_gr, "tier1", fa)
+fasta_conversion(specificADAR_control, "specificADAR_control", fa)
+fasta_conversion(specificΔRRM_control, "specificDRRM_control", fa)
+```
+
+
+# Region distribution of editing sites with max editing percentage
+```{r}
+# collect editing sites with max editing percentage per gene then add region annotation
+max_site_df <- as.data.frame(m3specific_site_gr_anno) %>%
+  group_by(gene_id) %>%
+  slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+  ungroup() 
+
+# add genomic region annotation to the max editing sites
+max_site_region_counts <- max_site_df %>%
+  distinct(gene_id, region, .keep_all = TRUE) %>% 
+  mutate(region = ifelse(is.na(region), "Others", region)) %>%
+  group_by(region) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage = count / sum(count) * 100,
+         class = "M3-specific gene")
+```
+
+
+# Region distribution per max editing sites per tier
+* For each tier, count the number of max editing sites that fall into each genomic region category, then calculate the percentage distribution of regions within each tier. This will show if certain tiers are enriched for specific regions (e.g., Tier 1 having more CDS sites) compared to others.
+```{r}
+# Count genomic regions per tier
+############################################################
+tier_region_maxedit_df <- max_site_df %>%
+  left_join(
+    rank_M3tx_manual_df %>% dplyr::select(-c(gene_name, gene_length_kb)),
+    by = "gene_id") %>%
+  mutate(
+    gene_id = as.character(gene_id),
+    rank    = as.character(rank),
+    region  = as.character(region),
+    region  = dplyr::if_else(is.na(region) | region == "", "Others", region)
+  ) %>%
+  filter(!is.na(rank))
+
+tier_region_maxedit_counts <- tier_region_maxedit_df %>%
+  dplyr::count(rank, region, name = "count") %>%
+  dplyr::group_by(rank) %>%
+  dplyr::mutate(percentage = count / sum(count) * 100) %>%
+  dplyr::ungroup() 
+```
+
+* Region distribution of all control genes with max editing percentage (with Ttn tier1 version)
+```{r}
+# collect editing sites with max editing %  in controls
+all_control_region_maxedit_list <- setNames(
+  lapply(names(all_control_list_HT), function(cond) {
+    
+    df <- all_control_list_HT[[cond]]
+    
+    df %>%
+      group_by(gene_id) %>%
+      slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      mutate(region = ifelse(is.na(region), "Others", region)) %>%
+      group_by(region) %>%
+      summarise(count = n()) %>%
+      arrange(desc(count)) %>%
+      mutate(percentage = count / sum(count) * 100,
+             rank = cond)}),
+  names(all_control_list_HT))
+
+# combine into one df for plotting
+control_region_maxedit_counts <- bind_rows(all_control_region_maxedit_list) %>%
+  mutate(class = recode(
+    rank,
+    "only_ADARctrl" = "ADAR specific",
+    "only_ΔRRMctrl" = "ΔRRM specific"))
+```
+
+the distribution reflects site-level burden and is more strongly influenced by genes with large numbers of editing sites, such as long or highly edited transcripts.
+
+# Compare the region distribution of Matrin3-specific target genes with all control genes (With Ttn tier1 version)
+```{r}
+tiers <- c("Tier 1", "Tier 2", "Tier 3")
+
+plot_region_tier_df <- bind_rows(
+  control_region_maxedit_counts %>%
+    filter(class %in% c("ADAR specific", "ΔRRM specific")),
+  
+  tier_region_maxedit_counts %>%
+    mutate(class = rank) %>%  
+    filter(class %in% c("Tier 1", "Tier 2", "Tier 3"))) %>%
+  mutate(
+    class = factor(
+      class,
+      levels = c("ADAR specific", "ΔRRM specific", "Tier 1", "Tier 2", "Tier 3")),
+    region = factor(
+      region,
+      levels = c("UTR5", "UTR3", "CDS", "Intron", "Others")
+    ))
+
+##################### Stacked barplot
+ggplot(plot_region_tier_df, aes(x = class, y = percentage, fill = region)) +
+  geom_col(color = "black", linewidth = 0.3, width = 0.75) +
+  geom_text(
+    aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = region_colors) +
+  labs(
+    title = "",
+    x = NULL,
+    y = "Proportion of editing sites",
+    fill = "Regions"
+  ) +
+  coord_cartesian(ylim = c(0, 112), clip = "off") +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold", angle = 30, hjust = 1),
+    axis.text.y = element_text(size = 14)
+  )
+```
+
+
+* For each gene, determine which region has the highest density of editing sites (number of sites / region length in kb) and compare this distribution across tiers and controls to see if certain tiers are enriched for editing in specific regions in terms of region length.
+```{r}
+# Count editing sites per region per gene
+sites_per_region_df <- as.data.frame(m3specific_site_gr_anno) %>%
+  mutate(region = ifelse(is.na(region) | region == "", "Others", region)) %>%
+  group_by(gene_id, region) %>%
+  summarise(n_sites = n(), .groups = "drop")
+
+# Calculate density
+density_region_df <- sites_per_region_df %>%
+  left_join(region_length_df, by = c("gene_id", "region")) %>%
+  mutate(
+    site_density = case_when(
+      is.na(region_length_kb) ~ NA_real_,     
+      TRUE                    ~ n_sites / region_length_kb))
+
+# For each gene, pick the region with the max editing site density
+max_density_region_df <- density_region_df %>%
+  filter(!is.na(site_density)) %>%
+  group_by(gene_id) %>%
+  slice_max(order_by = site_density, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Count region distribution per tier based on max density region
+tier_region_density_counts <- max_density_region_df %>%
+  left_join(rank_M3tx_manual_df, by = "gene_id") %>%
+  mutate(
+    region = ifelse(is.na(region) | region == "", "Others", region),
+    rank   = as.character(rank)) %>%
+  filter(!is.na(rank)) %>%
+  dplyr::count(rank, region, name = "count") %>%
+  dplyr::group_by(rank) %>%
+  dplyr::mutate(percentage = count / sum(count) * 100) %>%
+  dplyr::ungroup() 
+
+```
+
+# Same approach for control samples
+```{r}
+control_region_density_counts <- bind_rows(
+  lapply(names(all_control_list_HT), function(cond) {
+    
+    df <- all_control_list_HT[[cond]]
+    
+    # Count sites per region per gene
+    sites_per_region <- df %>%
+      mutate(region = ifelse(is.na(region) | region == "", "Others", region)) %>%
+      group_by(gene_id, region) %>%
+      summarise(n_sites = n(), .groups = "drop")
+    
+    # calculate density
+    sites_per_region %>%
+      left_join(region_length_df, by = c("gene_id", "region")) %>%
+      mutate(
+        site_density = case_when(
+          is.na(region_length_kb) | region_length_kb == 0 ~ NA_real_,
+          TRUE ~ n_sites / region_length_kb)) %>%
+      # Pick region with max density per gene
+      filter(!is.na(site_density)) %>%
+      group_by(gene_id) %>%
+      slice_max(order_by = site_density, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      group_by(region) %>%
+      summarise(count = n(), .groups = "drop") %>%
+      mutate(
+        percentage = count / sum(count) * 100,
+        class      = cond)})) %>%
+  mutate(
+    class = recode(
+      class,
+      "only_ADARctrl" = "ADAR specific",
+      "only_ΔRRMctrl" = "ΔRRM specific"))
+
+# combine into one df for plotting
+plot_region_density_df <- bind_rows(
+  control_region_density_counts %>%
+    filter(class %in% c("ADAR specific", "ΔRRM specific")),
+  tier_region_density_counts %>%
+    mutate(class = rank) %>%
+    filter(class %in% c("Tier 1", "Tier 2", "Tier 3"))) %>%
+  mutate(
+    class = factor(
+      class,
+      levels = c("ADAR specific", "ΔRRM specific", "Tier 1", "Tier 2", "Tier 3")),
+    region = factor(
+      region,
+      levels = c("UTR5", "UTR3", "CDS", "Intron", "Others")))
+```
+
+
+```{r}
+plot_region_density <- ggplot(plot_region_density_df, aes(x = class, y = percentage, fill = region)) +
+  geom_col(color = "black", linewidth = 0.3, width = 0.75) +
+  geom_text(
+    aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    fontface = "bold") +
+  scale_fill_manual(values = region_colors) +
+  labs(
+    title = "",
+    x = NULL,
+    y = "Proportion of regions with \nhighest editing site density",
+    fill = "Regions") +
+  coord_cartesian(ylim = c(0, 112), clip = "off") +
+  theme_bw(base_size = 13) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold", angle = 30, hjust = 1),
+    axis.text.y = element_text(size = 14))
+
+# save_thesis_plot(
+#   plot_region_density,
+#   filename = file.path("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+#                        "region_density_distribution.png"),
+#   width = 8,
+#   height = 6,
+#   dpi = 300,
+#   bg = "white")
+
+plot_region_density
+```
+
+# Region length distribution among MATR3 target tiers
+```{r}
+length_plot_df <- region_length_df %>%
+  inner_join(rank_M3tx_manual_df %>% dplyr::select(gene_id, rank), by = "gene_id") %>%
+  mutate(
+    rank = factor(rank, levels = c("Tier 1", "Tier 2", "Tier 3")), 
+    region = factor(region, levels = c("UTR5", "CDS", "Intron", "UTR3")) 
+  ) %>%
+  filter(!is.na(rank))
+
+# 2. Generate the faceted violin plot
+region_length_plot <- ggplot(length_plot_df, aes(x = rank, y = log10(region_length_kb), fill = rank)) +
+  geom_violin(trim = FALSE, alpha = 0.7, color = "black", linewidth = 0.5) +
+  geom_boxplot(width = 0.15, fill = "white", color = "black", outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = tier_colors) +
+  facet_wrap(~ region, scales = "free_y", nrow = 1) +
+  labs(
+    x = "",
+    y = "log10(region length (kb))") +
+  theme_bw(base_size = 14) +
+  theme_thesis() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(color = "black", size = 15, face = "bold"))
+
+region_length_plot
+
+```
+
+```{r}
+# Annotate editing sites with tier
+m3_sites_tier_df <- as.data.frame(m3specific_site_gr_anno) %>%
+  left_join(
+    rank_M3tx_manual_df %>%
+      dplyr::select(gene_id, rank),
+    by = "gene_id") %>%
+  mutate(
+    region = ifelse(
+      is.na(region) | region == "",
+      "Others",
+      region),
+    class = rank) %>%
+  filter(
+    !is.na(class),
+    class %in% c("Tier 1", "Tier 2", "Tier 3"),
+    region %in% c("UTR5", "UTR3", "CDS", "Intron"))
+
+# Count total editing sites per region within each tier
+tier_site_counts <- m3_sites_tier_df %>%
+  group_by(class, region) %>%
+  summarise(
+    total_sites = n(),
+    .groups = "drop")
+
+# Calculate total region length within each tier
+tier_region_lengths <- rank_M3tx_manual_df %>%
+  dplyr::select(gene_id, rank) %>%
+  rename(class = rank) %>%
+  inner_join(region_length_df, by = "gene_id") %>%
+  filter(
+    class %in% c("Tier 1", "Tier 2", "Tier 3"),
+    region %in% c("UTR5", "UTR3", "CDS", "Intron")) %>%
+  group_by(class, region) %>%
+  summarise(
+    total_region_kb = sum(region_length_kb, na.rm = TRUE),
+    .groups = "drop")
+
+# Calculate normalized editing density
+# Calculate normalized editing density
+tier_density_df <- tier_site_counts %>%
+  left_join(
+    tier_region_lengths,
+    by = c("class", "region")
+  ) %>%
+  mutate(
+    editing_density = total_sites / total_region_kb
+  ) %>%
+  group_by(class) %>%
+  mutate(
+    percentage =
+      editing_density / sum(editing_density) * 100
+  ) %>%
+  ungroup()
+```
+
+
+
+```{r}
+# 3. CONTROL DATASETS
+
+control_density_df <- bind_rows(
+
+  lapply(names(all_control_list_HT), function(cond) {
+
+    df <- all_control_list_HT[[cond]]
+
+    # Editing site counts per region
+    site_counts <- df %>%
+      mutate(
+        region = ifelse(
+          is.na(region) | region == "",
+          "Others",
+          region)) %>%
+      filter(
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")
+      ) %>%
+      group_by(region) %>%
+      summarise(
+        total_sites = n(),
+        .groups = "drop")
+
+    # Genes present in this control dataset
+    genes_in_control <- unique(df$gene_id)
+
+    # Total region length across genes
+    region_lengths <- region_length_df %>%
+      filter(
+        gene_id %in% genes_in_control,
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")) %>%
+      group_by(region) %>%
+      summarise(
+        total_region_kb = sum(region_length_kb, na.rm = TRUE),
+        .groups = "drop")
+
+    # Density
+    site_counts %>%
+      left_join(region_lengths, by = "region") %>%
+      mutate(
+        editing_density = total_sites / total_region_kb,
+        percentage = editing_density / sum(editing_density) * 100,
+        class = cond)})) %>%
+  mutate(
+    class = recode(
+      class,
+      "only_ADARctrl" = "ADAR specific",
+      "only_ΔRRMctrl" = "ΔRRM specific")) 
+
+# 4. COMBINE MATR3 + CONTROLS
+
+plot_region_density_df <- bind_rows(
+  control_density_df,
+  tier_density_df) %>%
+  mutate(
+    class = factor(
+      class,
+      levels = c(
+        "ADAR specific",
+        "ΔRRM specific",
+        "Tier 1",
+        "Tier 2",
+        "Tier 3")),
+    region = factor(
+      region,
+      levels = c("UTR5", "CDS", "Intron", "UTR3")))
+
+# 5. PLOT
+plot_region_density <- ggplot(
+  plot_region_density_df,
+  aes(
+    x = class,
+    y = percentage,
+    fill = region)) +
+ geom_col(color = "black", position = "fill",linewidth = 0.3, width = 0.75) +
+  geom_text(
+    aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+    position = position_fill(vjust = 0.5),
+    size = 4,
+    fontface = "bold") +
+  scale_fill_manual(values = region_colors) +
+  labs(
+    x = NULL,
+    y = "Proportion of normalized editing density",
+    fill = "Regions"
+  ) +
+   theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(color = "black", size = 14, face = "bold", angle = 30, hjust = 1),
+    axis.text.y = element_text(size = 14))
+
+plot_region_density
+
+# Save plot
+# ============================================================
+
+save_thesis_plot(
+  plot_region_density,
+  filename = file.path(
+    "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png",
+    "tier_region_distribution.png"
+  ),
+  width = 7.5,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+```{r}
+############################################################
+# Gene-level regional editing density distribution
+# Tier vs controls
+############################################################
+
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+############################################################
+# 1. MATR3 TIER GENE-LEVEL DENSITY
+############################################################
+
+m3_gene_region_density <- as.data.frame(m3specific_site_gr_anno) %>%
+  
+  left_join(
+    rank_M3tx_manual_df %>%
+      dplyr::select(gene_id, rank),
+    by = "gene_id"
+  ) %>%
+  
+  mutate(
+    region = ifelse(
+      is.na(region) | region == "",
+      "Others",
+      region
+    ),
+    class = rank
+  ) %>%
+  
+  filter(
+    !is.na(class),
+    class %in% c("Tier 1", "Tier 2", "Tier 3"),
+    region %in% c("UTR5", "UTR3", "CDS", "Intron")
+  ) %>%
+  
+  # count editing sites PER GENE
+  group_by(gene_id, class, region) %>%
+  summarise(
+    total_sites = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # add region length PER GENE
+  left_join(
+    region_length_df %>%
+      filter(
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")
+      ),
+    by = c("gene_id", "region")
+  ) %>%
+  
+  mutate(
+    editing_density = total_sites / region_length_kb,
+    
+    # log transform
+    log_density = log10(editing_density)
+  )
+
+############################################################
+# 2. CONTROL GENE-LEVEL DENSITY
+############################################################
+
+control_gene_region_density <- bind_rows(
+
+  lapply(names(all_control_list_HT), function(cond) {
+
+    df <- all_control_list_HT[[cond]]
+
+    df %>%
+      
+      mutate(
+        region = ifelse(
+          is.na(region) | region == "",
+          "Others",
+          region
+        )
+      ) %>%
+      
+      filter(
+        region %in% c("UTR5", "UTR3", "CDS", "Intron")
+      ) %>%
+      
+      # count editing sites PER GENE
+      group_by(gene_id, region) %>%
+      summarise(
+        total_sites = n(),
+        .groups = "drop"
+      ) %>%
+      
+      # add region length PER GENE
+      left_join(
+        region_length_df %>%
+          filter(
+            region %in% c("UTR5", "UTR3", "CDS", "Intron")
+          ),
+        by = c("gene_id", "region")
+      ) %>%
+      
+      mutate(
+        editing_density = total_sites / region_length_kb,
+        log_density = log10(editing_density),
+        class = cond
+      )
+
+  })
+
+) %>%
+  
+  mutate(
+    class = recode(
+      class,
+      "only_ADARctrl" = "ADAR specific",
+      "only_ΔRRMctrl" = "ΔRRM specific"
+    )
+  )
+
+############################################################
+# 3. COMBINE
+############################################################
+
+plot_violin_df <- bind_rows(
+  control_gene_region_density,
+  m3_gene_region_density
+) %>%
+  
+  mutate(
+    class = factor(
+      class,
+      levels = c(
+        "ADAR specific",
+        "ΔRRM specific",
+        "Tier 1",
+        "Tier 2",
+        "Tier 3"
+      )
+    ),
+    
+    region = factor(
+      region,
+      levels = c(
+        "UTR5",
+        "CDS",
+        "Intron",
+        "UTR3"
+      )
+    )
+  )
+
+############################################################
+# 4. STATISTICAL COMPARISONS
+############################################################
+
+comparisons <- list(
+  c("Tier 1", "Tier 2"),
+  c("Tier 2", "Tier 3"),
+  c("Tier 1", "Tier 3"))
+
+
+############################################################
+# 5. VIOLIN PLOT
+############################################################
+
+plot_region_violin <- ggplot(
+  plot_violin_df,
+  aes(
+    x = class,
+    y = log_density,
+    fill = class
+  )
+) +
+  
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.7,
+    color = "black"
+  ) +
+  
+  geom_boxplot(
+    width = 0.12,
+    outlier.shape = NA,
+    alpha = 0.9
+  ) +
+  
+  stat_compare_means(
+    comparisons = comparisons,
+    method = "wilcox.test",
+    label = "p.signif",
+    hide.ns = TRUE,
+    size = 4
+  ) +
+  
+  facet_wrap(
+    ~region,
+    scales = "free_y"
+  ) +
+  
+  labs(
+    x = NULL,                                             
+   y    = "Editing density (sites / kb, log10 scale)") +
+  
+  theme_bw(base_size = 14) +
+  
+  theme(
+    strip.text = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    
+    legend.position = "none",
+    
+    axis.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    
+    axis.text.x = element_text(
+      color = "black",
+      size = 12,
+      face = "bold",
+      angle = 30,
+      hjust = 1
+    ),
+    
+    axis.text.y = element_text(
+      size = 12,
+      color = "black"
+    )
+  )
+
+plot_region_violin
+```
+
+# GO compare Tier
+```{r}
+# remove suffix 
+# tier_classify_df$GeneID <- gsub("\\.\\d+$", "", tier_classify_df$gene_id)
+# 
+# cc_bp <- compareCluster(
+#   geneCluster   = tier_classify_df$GeneID,
+#   fun           = "enrichGO",
+#   OrgDb         = org.Mm.eg.db,
+#   keyType       = "ENSEMBL",
+#   ont           = "ALL",
+#   universe      = gene_anno_df$GeneID,
+#   pAdjustMethod = "BH",
+#   pvalueCutoff  = 0.05,
+#   qvalueCutoff  = 0.05,
+#   readable      = TRUE)
+
+```
+
+```{r}
+# dotplot_cc_bp <- dotplot(
+#   cc_bp,
+#   showCategory = 10,
+#   title        = "GO Enrichment Comparison across MATR3 Target Tiers",
+#   font.size    = 15,
+#   label_format = 30) +
+#   theme_light(base_size = 15) +
+#   theme(
+#     plot.title       = element_text(hjust = 0.5, face = "bold", size = 20),
+#     strip.text       = element_text(size = 17, face = "bold", color = "white"),
+#     strip.background = element_rect(fill = "grey20"),
+#     axis.title.x     = element_blank(),
+#     axis.text.x      = element_text(color = "black", size = 15, face = "bold"),
+#     axis.text.y      = element_text(color = "black", size = 13),
+#     legend.title     = element_text(size = 15, face = "bold"),
+#     legend.text      = element_text(size = 14),
+#     legend.key.size  = unit(0.9, "cm"),
+#     panel.grid.minor = element_blank(),
+#     plot.margin      = margin(10, 15, 10, 10)) +
+#   guides(
+#     color = guide_colorbar(title = "Adjusted\np-value"),
+#     size  = guide_legend(title = "Gene\nCount"))
+
+# save_thesis_plot(
+#   plot = dotplot_cc_bp,
+#   filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/compareCluster_tiers.png",
+#   width = 10,
+#   height = 12)
+```
+
+```{r}
+sessionInfo()
+```
+
+

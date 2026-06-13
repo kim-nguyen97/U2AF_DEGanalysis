@@ -1,0 +1,759 @@
+---
+title: "pureCLIP"
+format: html
+editor: visual
+---
+
+```{r message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+library(purrr)
+library(rtracklayer)
+library(ggplot2)
+library(tidyverse)
+library(BindingSiteFinder)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(GenomicFeatures)
+library(rtracklayer)
+library(GenomicAlignments)
+library(eulerr)
+out <- "/Users/tinkienoob/Master_thesis/MATR3/pureCLIP_ENA_iCLIP_M3_brain/"
+```
+
+# pureCLIP
+
+Like Hypertribe data, pureCLIP data is also needed to filter to collect high confidence binding motifs. https://www.bioconductor.org/packages/release/bioc/vignettes/BindingSiteFinder/inst/doc/vignette.html
+
+iCLIP captures the exact nucleotide where the protein crosslinked to the RNA. PureCLIP is designed to report this single-nucleotide resolution. Therefore, in a standard BED file , a single nucleotide at position: 0-based start, 1-based end.
+
+For iCLIP (crosslinking sites), threshold is added to filter/ distinguish true/ high-affinity binding sites from low-affinity/ background noises.
+
+# Manage the input data
+
+```{r}
+# Read high confidence editing sites
+m3specific_site <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/m3specific_sites2.rds")
+rank_M3tx_df <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/rank_M3_target_manual.rds") %>%
+  mutate(GeneID = sub("(.+)\\..*", "\\1", gene_id))
+load("/Users/tinkienoob/Master_thesis/MATR3/Deseq2/dds_df_full/fulldds_DESeq2.RData")
+
+mydds_res_list <- list(
+  "Matr3" = res_WT_vs_M3,
+  "dKO" = res_WT_vs_dKO,
+  "RBM20" = res_WT_vs_RBM20
+)
+
+save_thesis_plot <- function(plot, filename,
+                             width = 10, height = 6.5,
+                             dpi = 300, bg = "white") {
+  ggsave(
+    filename = filename,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = dpi,
+    bg = bg
+  )
+}
+
+```
+
+## Build the BSFDataSet
+
+```{r}
+M3_pureclip_file <- "/Users/tinkienoob/Master_thesis/MATR3/pureCLIP_ENA_iCLIP_M3_brain/iCLIP_M3_pureclip_crosslink_sites.bed"
+
+# read pureclip peaks
+peaks <- rtracklayer::import(con = M3_pureclip_file, 
+                             format = "BED", 
+                             extraCols=c("additionalScores" = "character"))
+
+# clean pureclip peaks columns
+peaks$additionalScores <- NULL
+#peaks$name <- NULL
+
+# Optionally keep only standard chromosomes and drop chrM
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse") %>% 
+     dropSeqlevels(., "chrM", pruning.mode = "coarse")
+```
+
+# crosslink sites check?
+
+```{r}
+# Import hypertribe bed files for cross-checking
+folder <- "/Users/tinkienoob/Master_thesis/MATR3/HT_Bed_peaks"
+
+# List all .bg files
+files <- list.files(folder, pattern = "\\.bedGraph$", full.names = TRUE)
+
+# Import all BED files into a named list
+HT_bed_list <- lapply(files, function(file) {
+  rtracklayer::import(con = file, format = "bedGraph")
+})
+
+# Name each element after the file (without suffix)
+names(HT_bed_list) <- gsub("\\.bedGraph$", "", basename(files))
+```
+
+```{r}
+M3_pureclip_df <- read.table(M3_pureclip_file, header=FALSE) %>%
+  mutate(
+    # V7 is the 7th column where PureCLIP stores the score strings
+    CrosslinkScore = as.numeric(str_extract(V7, "(?<=score_CL=)[0-9\\.]+")),
+    CoverageScore  = as.numeric(str_extract(V7, "(?<=score_E=)[0-9\\.]+")),
+    BindingScore   = as.numeric(str_extract(V7, "(?<=score_B=)[0-9\\.]+"))
+  ) %>%
+  dplyr::select(-V7) %>%
+  distinct()
+colnames(M3_pureclip_df)[1:6] <- c("seqnames", "start", "end", "name", "score", "strand")
+```
+
+```{r}
+hist(
+  M3_pureclip_df$BindingScore,
+  breaks = 50,
+  main = "Distribution of MATR3 Binding Scores",
+  xlim = c(0, 500)
+)
+
+# Removing sites with very low probability scores (noise)
+M3clean_pureclip_df <- M3_pureclip_df[M3_pureclip_df$BindingScore >= 2, ]
+M3_pureclip_df
+```
+
+# Top 20% binding sites with highest binding score
+
+```{r}
+# top 20% threshold
+top20_cutoff <- quantile(M3clean_pureclip_df$BindingScore, probs = 0.80, na.rm = TRUE)
+
+M3clean_pureclip_df <- M3clean_pureclip_df %>%
+  mutate(
+    score_group = if_else(BindingScore >= top20_cutoff, "Top20", "Bottom80")
+  )
+
+table(M3clean_pureclip_df$score_group)
+
+######################### Convert to GRanges
+pureclip_gr <- GRanges(
+  seqnames = M3clean_pureclip_df$seqnames,
+  ranges   = IRanges(start = M3clean_pureclip_df$start + 1, end = M3clean_pureclip_df$end),
+  strand   = M3clean_pureclip_df$strand
+)
+
+mcols(pureclip_gr)$BindingScore   <- M3clean_pureclip_df$BindingScore
+mcols(pureclip_gr)$CrosslinkScore <- M3clean_pureclip_df$CrosslinkScore
+mcols(pureclip_gr)$CoverageScore  <- M3clean_pureclip_df$CoverageScore
+mcols(pureclip_gr)$score_group    <- M3clean_pureclip_df$score_group
+```
+
+```{r}
+regions_list <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/mm39_region_list.rds")
+
+annotate_regions_from_list <- function(query_gr, region_list, 
+                                       priority = c("CDS", "UTR3", "UTR5", "Intron", "ncRNA", "Other")) {
+  region_hits <- lapply(names(region_list), function(reg) {
+    hits <- findOverlaps(query_gr, region_list[[reg]], ignore.strand = FALSE)
+    tibble(
+      query_idx = queryHits(hits),
+      region = reg
+    )
+  }) %>% bind_rows()
+
+  # if one site overlaps multiple regions, keep one by priority
+  region_hits <- region_hits %>%
+    mutate(region = as.character(region),
+           region = if_else(region %in% priority, region, "Other"),
+           region = factor(region, levels = priority)) %>%
+    arrange(query_idx, region) %>%
+    distinct(query_idx, .keep_all = TRUE)
+
+  anno_df <- tibble(query_idx = seq_along(query_gr)) %>%
+    left_join(region_hits %>% mutate(region = as.character(region)), by = "query_idx") %>%
+    mutate(region = replace_na(region, "Other"))
+
+  anno_df$region
+}
+
+mcols(pureclip_gr)$region <- annotate_regions_from_list(
+  query_gr = pureclip_gr,
+  region_list = regions_list,
+  priority = c("CDS", "UTR3", "UTR5", "Intron", "ncRNA", "Other")
+)
+
+table(mcols(pureclip_gr)$region, useNA = "ifany")
+```
+
+```{r}
+region_comp_df <- as.data.frame(mcols(pureclip_gr)) %>%
+  dplyr::count(score_group, region, name = "n") %>%
+  group_by(score_group) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+ggplot(region_comp_df, aes(x = score_group, y = percent, fill = region)) +
+  geom_col(width = 0.7) +
+  theme_bw(base_size = 12) +
+  labs(
+    x = NULL,
+    y = "Percentage of pureCLIP sites",
+    fill = "Region",
+    title = "Region composition of top 20% pureCLIP binding-score sites"
+  ) +
+  scale_fill_brewer(palette = "Spectral")
+```
+
+```{r}
+score_region_df <- as.data.frame(mcols(pureclip_gr)) %>%
+  mutate(region = factor(region, levels = c("Intron", "UTR3", "UTR5", "CDS", "Other")))
+
+ggplot(score_region_df, aes(x = region, y = BindingScore, fill = region)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  coord_cartesian(ylim = quantile(score_region_df$BindingScore, c(0.05, 0.95), na.rm = TRUE)) +
+  theme_bw(base_size = 12) +
+  labs(
+    x = NULL,
+    y = "BindingScore",
+    title = "BindingScore distribution across transcript regions"
+  )
+```
+
+# Import bigWig
+
+```{r}
+bw_path <- "/Users/tinkienoob/Master_thesis/MATR3/matr3_iCLIP/BamToBigWig"
+
+bw.plus <- list.files(bw_path, pattern = "plus.bw$", full.names = TRUE, recursive = TRUE)
+
+bw.minus <- list.files(bw_path, pattern = "minus.bw$", full.names = TRUE, recursive = TRUE)
+
+```
+
+```{r}
+# read prepared annotation
+gns1 <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/gns_mm39.rds")
+
+region_anno <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/mm39_region_list.rds")
+```
+
+# Peaks from pureclip
+
+```{r}
+# make metadata for BindingSiteFinder
+meta <- data.frame(
+  id = seq_along(bw.plus), 
+  condition = factor("WT"),
+  clPlus = bw.plus,
+  clMinus = bw.minus
+)
+
+meta
+```
+
+# run BindingSiteFinder in automatic mode
+
+```{r}
+# create BindingSiteFinder object
+bds_object <- BSFDataSetFromBigWig(ranges = peaks, 
+                           meta = meta, 
+                           silent = FALSE)
+```
+
+# Make inital BS allowing BSF to determine automatic parameters
+
+```{r}
+bds_automatic <- BSFind(bds_object, 
+                 anno.genes = gns1, 
+                 anno.transcriptRegionList = region_anno, 
+                 cutoff.geneWiseFilter = 0,
+                 repro.nReps = 2,
+                 repro.cutoff = 0.05)
+
+# save automatic binding sites
+saveRDS(bds_automatic, paste0(out, "bds_automatic.rds"))
+```
+
+# Binding site summary
+
+```{r}
+bds_automatic <- readRDS(paste0(out, "bds_automatic.rds"))
+bds_automatic
+estimateBsWidthPlot(bds_automatic)
+```
+
+# Visualize steps and filters
+
+```{r}
+processingStepsFlowChart(bds_automatic)
+```
+
+# Pre-filtering of crosslink sites
+
+```{r}
+png(paste0(out, "globalfilter_bs5.png"), width = 1400, height = 800, res = 300)
+pureClipGlobalFilterPlot(bds_selected_bs5)
+dev.off()
+```
+
+# Gene-wise filter
+
+The gene-wise filter cutoff estimated in the previous step (cutoff.geneWiseFilter) is applied to keep only the top percent of crosslink sites, ranked by their PureCLIP score. Many duplicates/ overlaps occurs due to dense single 1 nucleotide crosslink sites. The presence of duplicates can indicate that the algorithm is correctly identifying clusters of crosslinking events, which may represent true binding sites. However, it can also suggest that the parameters for merging crosslinks into binding sites may need to be adjusted to better capture the underlying biology without over-merging distinct sites.
+
+```{r}
+duplicatedSitesPlot(bds_automatic)
+```
+
+```{r}
+png(paste0(out, "summaryplot_bs5.png"), width = 1600, height = 800, res = 250)
+makeBsSummaryPlot(bds_selected_bs5)
+dev.off()
+
+```
+
+# Compute binding sites with different widths
+
+```{r}
+bds1 <- makeBindingSites(object = bds_object, bsSize = 3)
+bds2 <- makeBindingSites(object = bds_object, bsSize = 5)
+bds3 <- makeBindingSites(object = bds_object, bsSize = 7)
+bds4 <- makeBindingSites(object = bds_object, bsSize = 9)
+bds5 <- makeBindingSites(object = bds_object, bsSize = 13)
+bds6 <- makeBindingSites(object = bds_object, bsSize = 19)
+
+# summarize in list
+l = list(`1. bsSize = 3` = bds1, `2. bsSize = 5` = bds2, 
+         `3. bsSize = 7` = bds3, `4. bsSize = 9` = bds4,
+         `5. bsSize = 13` = bds5, `6. bsSize = 19` = bds6)
+
+# plot comparison with rangeCoveragePlot() is averaging crosslink coverage across all binding sites in each set.
+```
+
+```{r}
+png(paste0(out, "rangeCoverage.png"), width = 1600, height = 1000, res = 250)
+rangeCoveragePlot(l, width = 20, show.samples = TRUE, subset.chromosome = "chr3")
+dev.off()
+
+```
+
+# Merge crosslink sites into binding sites
+
+Region-to-fit width → How many nucleotides wide the candidate region is when BindingSiteFinder tries to merge nearby crosslinks.
+
+Region-to-fit #N → Number of regions that need that width to fit the crosslinks. Most binding evidence is concentrated in 1–3 nt windows.
+
+```{r}
+mergeCrosslinkDiagnosticsPlot(bds_automatic)
+```
+
+```{r}
+png(paste0(out, "regionenrich_bs5.png"), width = 1400, height = 800, res = 250)
+transcriptRegionSpectrumPlot(bds_selected_bs5)
+dev.off()
+
+```
+
+RBP is likely involved in pre-mRNA processing or alternative splicing rather than translation or mRNA stability (which would favor UTRs).
+
+# Ensure reproducibility among replicates
+
+```{r}
+reproducibilityFilterPlot(bds_automatic)
+```
+
+```{r}
+png(paste0(out, "reprodplot_bs5.png"), width = 1300, height = 1000, res = 250)
+reproducibilitySamplesPlot(bds_selected_bs5)
+dev.off()
+```
+
+# Genomic target idenitfication
+
+```{r}
+geneOverlapsPlot(bds_automatic)
+```
+
+```{r}
+targetGeneSpectrumPlot(bds_automatic)
+```
+
+# Transcript region identification
+
+```{r}
+p <- transcriptRegionSpectrumPlot(bds_selected_bs5) 
+p
+
+df <- p$data
+library(ggplot2)
+library(scales)
+
+# use your table directly (more robust than p$data)
+df <- data.frame(
+  region = c("Intron", "3'UTR", "CDS", "5'UTR"),
+  value  = c(9491, 447, 24, 7)
+)
+
+pp <- ggplot(df, aes(x = value, y = reorder(region, value))) +
+  
+  geom_col(fill = "#7A3B5D", width = 0.7) +
+  
+  geom_text(
+    aes(label = comma(value)),
+    color = "#D55E00",      # strong contrast (better than default orange)
+    hjust = -0.15,
+    size = 6,               # BIG for thesis
+    fontface = "bold"
+  ) +
+  
+  scale_x_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.2))
+  ) +
+  
+  labs(
+    title = "transcriptRegionSpectrumPlot()",
+    x = "#N Binding sites",
+    y = "Transcript region"
+  ) +
+  
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 14),
+    
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14),
+    axis.text.y = element_text(face = "bold"),
+    
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+save_thesis_plot(pp, "/Users/tinkienoob/Master_thesis/MATR3/pureCLIP_ENA_iCLIP_M3_brain/regionrich_bs5.png", 
+                 width = 8, height = 6)
+
+pp
+```
+
+```{r}
+bindingSiteDefinednessPlot(bds_automatic, by = "transcript")
+```
+
+# Binding site strength
+
+```{r}
+globalScorePlot(bds_automatic)
+```
+
+```{r}
+bindingSiteCoveragePlot(bds_automatic, plotIdx = 8, flankPos = 100, autoscale = TRUE)
+```
+
+```{r}
+pSites <- getRanges(bds_object)
+bindingSiteCoveragePlot(bds_automatic, plotIdx = 8, flankPos = 20, autoscale = TRUE,
+                        customRange = pSites, customRange.name = "pSites", shiftPos = -10)
+```
+
+# Merge replicate signal
+
+```{r}
+bdsMerge <- collapseReplicates(bds_object)[1:1000]
+covTotal <- coverageOverRanges(bdsMerge, returnOptions = "merge_positions_keep_replicates")
+
+covRep <- coverageOverRanges(bds_object[1:1000], returnOptions = "merge_positions_keep_replicates")
+
+df <- cbind.data.frame(mcols(covTotal), mcols(covRep)) %>%
+    mutate(rep1 = round(`1_WT`/ WT, digits = 2) * 100,
+           rep2 = round(`2_WT`/ WT, digits = 2) * 100,
+           rep3 = round(`3_WT`/ WT, digits = 2) * 100,
+           rep4 = round(`4_WT`/ WT, digits = 2) * 100,
+           rep5 = round(`5_WT`/ WT, digits = 2) * 100) %>%
+    tibble::rowid_to_column("BsID") %>%
+    dplyr::select(BsID, rep1, rep2, rep3, rep4, rep5) %>%
+    pivot_longer(-BsID) %>%
+    group_by(BsID) %>%
+    arrange(desc(value), .by_group = TRUE) %>%
+    mutate(name = factor(name, levels = name)) %>%
+    group_by(name) %>%
+    arrange(desc(value), .by_group = TRUE) %>%
+    mutate(BsID = factor(BsID, levels = BsID))
+
+
+ggplot(df, aes(x = BsID, y = value, fill = name)) +
+    geom_col(position = "fill", width = 1) +
+    theme_bw() +
+    scale_fill_brewer(palette = "Set3") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 7)) +
+    labs(x = "Binding site ID",
+         y = "Percentage",
+         fill = "Replicate"
+         ) +
+    scale_y_continuous(labels = scales::percent)
+```
+
+```{r skip-this-chunk, eval = FALSE}
+# Customize pipeline with specific parameters
+bds_selected_width <- BSFind(bds_object, 
+                 anno.genes = gns1, 
+                 anno.transcriptRegionList = region_anno, 
+                 bsSize = 5,
+                 cutoff.geneWiseFilter = 0.6,
+                 repro.nReps = 2,
+                 repro.cutoff = 0.05,
+                 overlaps.geneAssignment = "frequency",
+                 overlaps.TranscriptRegions = "frequency",
+                 est.maxBsWidth = 29,
+                 veryQuite = FALSE)
+
+saveRDS(bds_selected_width, paste0(out, "bds_selected_width.rds"))
+```
+
+```{r}
+bds_selected_bs5 <- readRDS(paste0(out, "bds_selected_width.rds"))
+bds_selected_bs5
+# Visualize steps and filters
+bs5_flowchart <- processingStepsFlowChart(bds_selected_bs5)
+
+save_thesis_plot(bs5_flowchart, "/Users/tinkienoob/Master_thesis/MATR3/pureCLIP_ENA_iCLIP_M3_brain/BS5_flowchart.png", 
+                 width = 6, height = 6)
+```
+
+```{r}
+bindingSiteCoveragePlot(bds_selected_bs5, plotIdx = 8, flankPos = 20, autoscale = TRUE,
+                        customRange = pSites, customRange.name = "pSites", shiftPos = -10)
+```
+
+```{r}
+# export binding sites as .bed
+# exportToBED(bds_selected_bs5, con = paste0(out, "BindingSites_bs5.bed"))
+# exportToBED(bds_automatic, con = paste0(out, "BindingSites_auto.bed"))
+```
+
+# Overlap binding sites with genes from gns
+
+```{r}
+
+bs5_gr <- getRanges(bds_selected_bs5)
+# Find overlaps: binding sites that fall in gene bodies
+bs5_hits <- GenomicRanges::findOverlaps(bs5_gr, gns1, ignore.strand = TRUE)
+
+# 3) Extract unique gene IDs overlapped by any binding site
+gene_ids_bs5 <- unique(names(gns1)[subjectHits(bs5_hits)])
+#gene_ids_bs5 <- sub("\\..*$", "", gene_ids_bs5)
+```
+
+# Overlap of genes between M3-specific editing with binding sites
+
+```{r}
+bs_es_genes_overlap <- list(
+  #`iCLIP binding-site\nenriched genes` = unique(gene_ids_bs5),
+ # `Top M3 targets`   = unique(rank_M3tx_df$gene_id),
+  `HyperTRIBE\nMATR3-specific targets` = unique(m3specific_site$gene_id),
+ `MATR3-DEGs` = unique(mydds_res_list$Matr3 %>% filter(regulated == TRUE) %>% pull(gene_id))
+)
+
+fit <- eulerr::euler(bs_es_genes_overlap)
+
+png("/Users/tinkienoob/Master_thesis/MATR3/Deseq2/es_deg_overlap.png",
+    width = 10, height = 6, units = "in", res = 800, bg = "white")
+
+plot(fit,
+  fills     = list(fill = c("#009E73", "dodgerblue3"), alpha = 0.5),
+  edges     = list(col = "white"),
+  stroke_size = 1,
+
+  # ── set/circle label size ─────────────────────────────────────────────
+  labels    = list(
+    fontsize = 18,          # size of "Binding Sites" / "Editing Sites" labels
+    fontface = "bold"
+  ),
+
+  # ── count/quantity label size ─────────────────────────────────────────
+  quantities = list(
+    fontsize = 20,          # size of the numbers inside circles
+    fontface = "plain"
+  )
+)
+
+dev.off()
+
+```
+
+```{r}
+bs_tier_overlap_list <- list(
+  `iCLIP binding-site enriched genes` = unique(gene_ids_bs5),
+  `Tier 1` = unique(rank_M3tx_df$gene_id[rank_M3tx_df$rank == "Tier 1"]),
+  `Tier 2` = unique(rank_M3tx_df$gene_id[rank_M3tx_df$rank == "Tier 2"]),
+  `Tier 3` = unique(rank_M3tx_df$gene_id[rank_M3tx_df$rank == "Tier 3"])
+)
+
+fit_bs_tiers <- eulerr::euler(bs_tier_overlap_list)
+fit_bs_tiers
+
+png("/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/BS_Tier_euler.png",
+    width = 10, height = 7, units = "in", res = 600, bg = "white")
+
+plot(
+  fit_bs_tiers,
+  fills = list(fill = c("#009E73", tier_colors), alpha = 0.55),
+  edges = list(col = "white", lwd = 1),
+  quantities = list(font = 2, cex = 1.2),
+  labels = list(font = 2, cex = 1.2),
+  percent = TRUE
+)
+
+dev.off()
+```
+
+```{r}
+tier_colors <- c(
+  "Tier 1" = "#CD534C", 
+  "Tier 2" = "#EFC050", 
+  "Tier 3" = "#45B7D1",
+  "Others" = "grey80")
+
+# Overlap binding sites with Hypertribe peaks
+# overlap_bs_es_genes <- Reduce(
+#   intersect,
+#   list(
+#     bs_es_genes_overlap$`Genes with Bs5`,
+#     bs_es_genes_overlap$`MATR3-specific targets`,
+#     bs_es_genes_overlap$`MATR3-DEGs`))
+
+# overlapping genes = bs ∩ es
+overlap_bs_es <- intersect(
+  unique(gene_ids_bs5),
+  unique(m3specific_site$gene_id)
+)
+
+# total genes per tier
+total_tier <- rank_M3tx_df %>%
+  filter(rank %in% c("Tier 1", "Tier 2", "Tier 3")) %>%
+  dplyr::count(rank, name = "total")
+
+# overlap genes per tier
+overlap_tier <- tibble(gene_id = overlap_bs_es) %>%
+  left_join(
+    rank_M3tx_df %>% dplyr::select(gene_id, rank),
+    by = "gene_id"
+  ) %>%
+  filter(rank %in% c("Tier 1", "Tier 2", "Tier 3")) %>%
+  dplyr::count(rank, name = "overlap")
+
+# merge and compute percentage
+bar_df <- total_tier %>%
+  left_join(overlap_tier, by = "rank") %>%
+  mutate(
+    overlap = replace_na(overlap, 0),
+    pct     = round(100 * overlap / total, 1),
+    label   = paste0(overlap, "/", total, " (", pct, "%)"),
+    rank    = factor(rank, levels = c("Tier 3", "Tier 2", "Tier 1"))  # bottom→top
+  )
+
+p_bar <- ggplot(bar_df) +
+
+  # ── background bar = total ───────────────────────────────────────────────
+  geom_col(aes(x = rank, y = total, fill = rank),
+           alpha = 0.30, width = 0.8) +
+
+  # ── foreground bar = overlap ─────────────────────────────────────────────
+  geom_col(aes(x = rank, y = overlap, fill = rank),
+           alpha = 1.00, width = 0.8) +
+
+  # ── percentage label to the right of background bar ─────────────────────
+  geom_text(aes(x = rank, y = total, label = label),
+            hjust   = 0.2,
+            fontface = "bold",
+            size    = 5) +
+
+  scale_fill_manual(values = tier_colors) +
+
+  coord_flip(clip = "off") +
+
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.28))
+  ) +
+
+  labs(
+    title = "",
+    x     = NULL,
+    y     = "Number of genes",
+    fill  = NULL
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.text   = element_text(size = 18, face = "bold"),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16, face = "bold"),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  ) 
+
+save_thesis_plot(p_bar, "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/BS_Tier_barplot.png", 
+                 width = 6.5, height = 6)
+
+p_bar       
+```
+
+```{r}
+# Total genes per tier
+total_tier_df <- rank_M3tx_df %>%
+  dplyr::count(rank, name = "total_genes")
+
+# Overlap genes per tier
+overlap_tier_df <- tibble(GeneID = overlap_bs_es_genes) %>%
+  left_join(rank_M3tx_df, by = "GeneID") %>%
+  filter(!is.na(rank)) %>%
+  dplyr::count(rank, name = "overlap_genes")
+
+# Percentage table for labels
+perc_tier_df <- total_tier_df %>%
+  left_join(overlap_tier_df, by = "rank") %>%
+  mutate(
+    overlap_genes = replace_na(overlap_genes, 0),
+    percentage = round(100 * overlap_genes / total_genes, 1),
+    label = paste0(percentage, "%")
+  )
+
+ggplot(total_tier_df, aes(x = rank, y = total_genes)) +
+  geom_col(aes(fill = rank), alpha = 0.35) +
+  geom_col(
+    data = overlap_tier_df,
+    aes(x = rank, y = overlap_genes, fill = rank)) +
+  coord_flip(clip = "off") +
+  theme_bw() +
+  labs(
+    title = "Overlap genes relative to total genes in each tier",
+    x = NULL,
+    y = "Number of genes") +
+  scale_fill_manual(values = tier_colors) +
+  geom_text(
+    data = perc_tier_df,
+    aes(
+      x = rank,
+      y = total_genes + max(total_tier_df$total_genes) * 0.03,
+      label = paste0(overlap_genes, "/", total_genes, " (", percentage, "%)")),
+    hjust = 0.1,
+    size = 3.5) +
+  theme(
+    legend.position = "none",
+    strip.text   = element_text(size = 18, face = "bold"),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  ) +
+  expand_limits(y = max(total_tier_df$total_genes) * 1.22)
+```
+
+# Session Info
+
+```{r, message=FALSE, warnings=FALSE}
+sessionInfo()
+```
