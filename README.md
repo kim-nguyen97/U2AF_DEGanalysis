@@ -3,37 +3,42 @@
 This repo contains the analysis pipeline behind a study of MATR3 (Matrin-3), an RNA-binding protein, in mouse cardiomyocytes.
 
 
-## Biological background
+### Biological background
 
 HyperTRIBE works by fusing MATR3 to a hyperactive ADAR catalytic domain. This fusion protein introduces adenosine-to-inosine (A-to-I) editing marks on RNA near genuine MATR3 binding sites, and these marks serve as a sequencing-detectable readout of where MATR3 binds.
 
 
-## Aim
+### Aim
 
 Identify MATR3's high-confidence mRNA targets and characterize their downstream effects on cardiomyocyte gene expression.
 
-## Experimental design
+### Experimental design
 
-Three datasets are integrated:
+Three datasets include:
 
-- **HyperTRIBE** – RNA editing-based detection of candidate MATR3 binding targets
+#### 1. HyperTRIBE — RNA editing-based detection of candidate MATR3 binding targets
 
-- **iCLIP** – independent validation of MATR3 binding sites
+| Condition | Construct | Purpose |
+|---|---|---|
+| **MATR3** (WT) | Full-length MATR3–dmADAR\* fusion | Identification of MATR3-associated RNA targets (experimental) |
+| **ΔRRM control** | RRM-deleted MATR3–dmADAR\* fusion | Captures editing events independent of MATR3 RNA binding |
+| **ADAR control** | dmADAR\* catalytic domain alone | Baseline background editing without MATR3 (negative control) |
 
-- **Bulk RNA-seq** – gene expression changes after *Matr3* knockout
+---
 
+#### 2. Bulk RNA-seq — Gene expression changes after *Matr3* conditional knockout
 
+| Model | Perturbation | Purpose |
+|---|---|---|
+| *Matr3*-cKO | Cardiomyocyte-specific *Matr3* deletion (XMLC2-Cre) | Primary dataset for differential gene expression |
+| *Rbm20*-KO | Global *Rbm20* deletion | Comparative reference |
+| Double-KO (dKO) | *Matr3*-cKO × *Rbm20*-KO | Combined perturbation effects |
 
-| Condition | Description |
+---
 
-|---|---|
+#### 3. iCLIP — Cross-validation of MATR3 binding sites
 
-| **MATR3** | Wild-type MATR3–ADAR fusion (experimental) |
-
-| **ΔRRM control** | RRM-domain-depleted MATR3–ADAR fusion (tests RRM-independent binding) |
-
-| **ADAR control** | ADAR domain alone, without MATR3 (negative control / background) |
-
+Independent MATR3 iCLIP data (Attig et al., 2018) used for spatial validation of HyperTRIBE-derived editing sites. Binding sites were called with PureCLIP and merged into binding regions using BindingSiteFinder.
 
 
 ## Reference data
@@ -66,10 +71,7 @@ APPRIS — https://appris.bioinfo.cnio.es
 4. **DESeq2_analysis.qmd** – Differential gene expression analysis of bulk RNA-seq data after cardiomyocyte-specific *Matr3* knockout
 
 
-
 ## Analysis pipeline
-
-
 
 To distinguish genuine MATR3-driven editing events from background noise inherent to the HyperTRIBE assay, I developed sequential quality filters and discarded signal also present in negative controls.
 
