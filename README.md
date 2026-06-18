@@ -1,24 +1,80 @@
-# MATR3-specific RNA Editing Site Identification
+# About the project
 
-Identifies high-confidence MATR3-dependent A-to-I RNA editing sites from
- HyperTRIBE data in mouse (*Mus musculus*, mm39).
+This repo contains the analysis pipeline behind a study of MATR3 (Matrin-3), an RNA-binding protein, in mouse cardiomyocytes.
 
-## Overview
 
-This analysis distinguishes true MATR3-driven editing events from backgr
-ound noise by applying sequential quality filters and subtracting signal
- present in negative controls. Three experimental conditions are compare
-d across four replicates each:
+## Biological background
+
+HyperTRIBE works by fusing MATR3 to a hyperactive ADAR catalytic domain. This fusion protein introduces adenosine-to-inosine (A-to-I) editing marks on RNA near genuine MATR3 binding sites, and these marks serve as a sequencing-detectable readout of where MATR3 binds.
+
+
+## Aim
+
+Identify MATR3's high-confidence mRNA targets and characterize their downstream effects on cardiomyocyte gene expression.
+
+## Experimental design
+
+Three datasets are integrated:
+
+- **HyperTRIBE** – RNA editing-based detection of candidate MATR3 binding targets
+
+- **iCLIP** – independent validation of MATR3 binding sites
+
+- **Bulk RNA-seq** – gene expression changes after *Matr3* knockout
+
+
 
 | Condition | Description |
-|-----------|-------------|
-| **MATR3** | Wild-type MATR3-ADAR fusion (experimental) |
-| **ΔRRMcontrol** | RRM-domain-depleted MATR3-ADAR (tests RRM-independen
-t binding) |
-| **ADARcontrol** | ADAR alone, no MATR3 (negative control / background)
- |
 
-## Analysis Pipeline
+|---|---|
+
+| **MATR3** | Wild-type MATR3–ADAR fusion (experimental) |
+
+| **ΔRRM control** | RRM-domain-depleted MATR3–ADAR fusion (tests RRM-independent binding) |
+
+| **ADAR control** | ADAR domain alone, without MATR3 (negative control / background) |
+
+
+
+## Reference data
+### Genome annotation
+
+GENCODE Mouse Release M37, GRCm39 (mm39), May 2025 — https://www.gencodegenes.org/mouse/release_M37.html
+
+
+
+### Principal isoform annotation
+
+APPRIS — https://appris.bioinfo.cnio.es
+
+
+
+## Software requirements
+
+- R (version: *add*)
+
+- RStudio
+
+## Repository structure
+
+1. **Highconfsites_M3_clean.qmd** – Identification of reproducible editing sites occurring specifically in the MATR3-HyperTRIBE dataset
+
+2. **Top-tx-M3.qmd** – Hierarchical ranking of candidate MATR3 target genes into confidence tiers
+
+3. **PureCLIP_analysis.qmd** – Peak calling and binding-site analysis from iCLIP data, for cross-validation against HyperTRIBE editing sites
+
+4. **DESeq2_analysis.qmd** – Differential gene expression analysis of bulk RNA-seq data after cardiomyocyte-specific *Matr3* knockout
+
+
+
+## Analysis pipeline
+
+
+
+To distinguish genuine MATR3-driven editing events from background noise inherent to the HyperTRIBE assay, I developed sequential quality filters and discarded signal also present in negative controls.
+
+
+
 ### Technical global filtering
 ```
 Raw HyperTRIBE calls (.bg + .txt)
