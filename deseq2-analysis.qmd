@@ -1,0 +1,2803 @@
+---
+title: "DESeq2_Matrin3"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+author:
+  - name: "Kim Nguyen"
+format:
+  html:
+    code-fold: TRUE
+    code-overflow: scroll
+    code-summary: "Show code"
+    code-tools: true
+    code-line-numbers: true
+    toc: true
+    toc-depth: 5
+    toc-location: right
+    toc-expand: true
+    number-sections: true
+    theme: sandstone
+    fontsize: 11pt
+    linestretch: 1.5
+    fig-format: png
+    cap-location: margin
+    body-width: 900px
+    sidebar-width: 300px
+    page-layout: full
+    crossref:
+      fig-title: Fig
+    embed-resources: true
+    link-external-newwindow: true
+    smooth-scroll: true
+    css: css.css
+    execute:
+      echo: true
+      warning: false
+---
+
+Differential Gene Expression (DGE): This refers to changes in the total abundance of all mRNA transcripts produced from a single gene between different conditions or cell types.
+Differential Alternative Splicing (DAS): This refers to changes in the relative proportions of different transcript isoforms produced from the same gene, while the total amount of mRNA for that gene may remain unchanged. 
+
+* Library
+```{r message = FALSE, warnings=FALSE}
+# For Plotting & Visualization
+#install.packages("VennDiagram")
+#BiocManager::install("genefilter")
+library(ggplot2)
+library(tidyverse)
+library(plotly)
+library(RColorBrewer)
+library(ggrepel)
+library(markdown)
+library(ggrastr)
+library(ggpointdensity)
+library(magrittr)
+library(dplyr)
+library(gridExtra)
+library(magrittr)
+library(magick)
+library(RColorBrewer)
+library(colorRamp2)
+library(ggvenn)
+library(kableExtra)
+library(ggdist)
+library(ggsci)
+library(ggsignif) # for geom_signif()
+library(ashr)
+library(ggrepel)
+library(ggpp)
+library(stringr)
+library(forcats)
+library(scales)
+# For analysis
+library(pheatmap)
+library(ComplexHeatmap)
+library(DESeq2)
+library(gprofiler2)
+library(clusterProfiler)
+library(enrichplot)
+library(showtext)# Effect size for U2AF2 pair
+library(cluster)
+library(factoextra)
+library(genefilter)
+library(ComplexUpset)
+library(tidyverse)
+library(ggstatsplot)
+library(gProfileR)
+
+# annotated mouse genome
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+
+#to combine multiple ggplot
+library(patchwork)
+library(reshape2)
+library(ggpubr)
+library(cowplot)
+```
+
+# Load outputs from previous analyses
+```{r message = FALSE, warnings=FALSE}
+outpath <- "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/"
+# Load the saved RDS file
+gene_anno_df <- readRDS(file = "/Users/tinkienoob/Master_thesis/MATR3/mm39_anno_gtf.RDS")
+
+load("/Users/tinkienoob/Master_thesis/MATR3/Deseq2/dds_df_full/fulldds_DESeq2.RData")
+
+m3specific_site <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/m3specific_sites2.rds")
+all_control_list_HT <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/HT_control_list.rds")
+rank_M3tx_df <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/rank_M3_target_manual.rds") %>%
+  mutate(GeneID = sub("(.+)\\..*", "\\1", gene_id)) %>%
+  # 🔥 ROBUST RECODING 🔥
+  mutate(
+    rank_char = as.character(rank), # Prevent silent factor coercion
+    rank = case_when(
+      grepl("Tier ?1", rank_char, ignore.case = TRUE) ~ "High",
+      grepl("Tier ?2", rank_char, ignore.case = TRUE) ~ "Intermediate",
+      grepl("Tier ?3", rank_char, ignore.case = TRUE) ~ "Low",
+      TRUE ~ rank_char # Leaves "Others" untouched safely
+    )
+  )
+#table(rank_M3tx_df$rank)
+save_thesis_plot <- function(plot, filename,
+                             width = 10, height = 6.5,
+                             dpi = 300, bg = "white") {
+  ggsave(
+    filename = filename,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = dpi,
+    bg = bg
+  )
+}
+
+# Standardize all plots for your thesis
+theme_thesis <- function(base_size = 16) {
+  theme_bw(base_size = base_size) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = base_size + 2),
+      axis.title = element_text(face = "bold", size = base_size),
+      axis.text = element_text(color = "black", size = base_size - 1),
+      legend.title = element_text(face = "bold", size = base_size - 1),
+      legend.text = element_text(size = base_size - 2),
+      strip.text = element_text(face = "bold", size = base_size - 1)
+    )
+}
+
+```
+
+
+* Input htseq count 
+data acquired from htseq_count (run by htseq_count on VScode - cluster - address: )
+** Prepare a table containing sample name, its conditions (which knock out), and its replicates
+```{r}
+# Input path
+countFolder <- "/Users/tinkienoob/Master_thesis/MATR3/M3_htseqcount_nonreverse"
+
+list.files(countFolder)
+# List all file containing "counts" in the folder
+countFiles <- list.files(countFolder, pattern = "htseq_forward")
+
+# Create sample table/ data frame for DESeq from Htseq-count
+## remove suffix in htseq output name
+sampleNames <- sub("_htseq_forward.txt", "", countFiles)
+
+# Split the string by the underscore "_"
+meta_data_parts <- strsplit(sampleNames, "_")
+
+# Extract the first part as condition (e.g., "dKO", "Matr3-cKO")
+conditions <- sapply(meta_data_parts, function(sample_name) {
+  paste(sample_name[1:(length(sample_name)-1)], collapse = "_")
+})
+
+# Extract the LAST part as the replicate
+replicates <- sapply(meta_data_parts, function(sample_name) {
+  sample_name[length(sample_name)]
+})
+
+# Create the df
+sampleTable <- data.frame(
+  sampleName = sampleNames,
+  fileName   = countFiles,
+  condition  = factor(conditions),
+  replicate  = factor(replicates)
+)
+
+sampleTable$condition <- relevel(sampleTable$condition, ref = "WT")
+```
+
+
+* Create the DESeqDataSet (without matrix)
+```{r}
+dds <- DESeqDataSetFromHTSeqCount(sampleTable = sampleTable,
+                                 directory = countFolder,
+                                 design = ~ condition)
+```
+
+```{r}
+# Check levels of condition
+levels(dds$condition)
+
+# Relevel to set WT as reference level
+dds$condition <- relevel(dds$condition, ref = "WT")
+```
+
+* Running DESeq2 analysis to identify differentially expressed genes
+```{r save-dds, eval=FALSE}
+# Deseq data object 
+dds = DESeq(dds)
+
+# Check the names of results available
+resultsNames(dds)
+
+# Save dds outout in the outpath as rds file
+saveRDS(dds, file = paste0(outpath, "dds_DESeq2_M3_RBM20.dds"))
+```
+
+
+# DESeq result
+```{r} 
+# Load the saved RDS file
+dds <- readRDS(file = paste0(outpath, "dds_DESeq2_M3_RBM20.dds"))
+
+# Identify all unique levels in your condition factor
+groups <- levels(dds$condition)
+
+# Generate all possible pairwise combinations
+comparisons <- combn(groups, 2)
+
+# Iterate through the combinations and run results()
+all_res <- apply(comparisons, 2, function(pair) {
+  results(dds, contrast = c("condition", pair[2], pair[1]), alpha = 0.05)
+})
+
+names(all_res) <- apply(comparisons, 2, function(pair) paste0(pair[2], "_vs_", pair[1]))
+
+names(all_res) <- gsub("-", "_", names(all_res)) 
+```
+
+## Annotate all genes with R mouse genome package
+There are probably many geneIds having the same gene name or it also could be same geneIds but different versions having the same gene name which create multiple similar geneIds in the gene annotation package. The version of the genes is used to track changes over time due to updates, transcript or feature changes, etc. 
+
+The GRCm39 (mm39) mouse genome assembly contains approximately 50,763 total genes, of which 22,198 are protein-coding genes according to the NCBI RefSeq annotation. 
+
+
+```{r}
+process_results_list <- function(res_obj, res_name, dds, gene_anno_df, output_dir) {
+  
+  # Convert to dataframe and keep gene_id
+  res_df <- as.data.frame(res_obj) %>%
+    tibble::rownames_to_column("gene_id")
+
+  # Split "GroupA_vs_GroupB" back into a vector
+  compared_data <- strsplit(res_name, "_vs_")[[1]]
+  contrast_vec <- c("condition", compared_data[2], compared_data[1])
+
+  # Shrinkage
+  res_ashr <- lfcShrink(dds = dds, contrast = contrast_vec, res = res_obj, type = "ashr")
+  
+  res_ashr_df <- as.data.frame(res_ashr) %>%
+    tibble::rownames_to_column("gene_id") %>%
+    dplyr::select(gene_id, log2FoldChange)
+  
+  # Merge shrinkage and annotations
+  res_df <- res_df %>%
+    dplyr::left_join(res_ashr_df, by = "gene_id", suffix = c("", ".ashr")) %>%
+    dplyr::left_join(gene_anno_df, by = "gene_id")
+  
+  # Add Regulation threshold
+  res_df <- res_df %>%
+    dplyr::mutate(
+      regulated = !is.na(padj) & padj < 0.05,
+      up_down = dplyr::case_when(
+        log2FoldChange.ashr > 0 & regulated ~ "up",
+        log2FoldChange.ashr < 0 & regulated ~ "down",
+        TRUE ~ "not regulated"
+      )
+    ) %>%
+    dplyr::arrange(desc(log2FoldChange.ashr))
+
+  # Save individual RData for each comparison
+  file_path <- file.path(output_dir, paste0("dds_res_", res_name, ".RData"))
+  save(res_df, file = file_path)
+  
+  return(res_df)
+}
+```
+
+setNames(): sets the names on an object and returns the object. In this case, it is used to assign names to the list of processed results based on the original comparison names. This allows you to easily access each processed results dataframe by its corresponding comparison name (e.g., dds_res_list$Matr3_cKO_vs_WT).
+```{r skip-this-chunk, eval = FALSE}
+# Process and save each results object
+dds_res_list <- setNames(lapply(names(all_res), function(res_name) {
+  process_results_list(
+    res_obj = all_res[[res_name]],
+    res_name = res_name,
+    dds = dds,
+    gene_anno_df = gene_anno_df,
+    output_dir = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/"
+  )
+}), names(all_res))
+
+#head(dds_res_list$dKO_vs_WT)
+
+res_WT_vs_M3 <- dds_res_list$Matr3_cKO_vs_WT %>%
+  mutate(GeneID = sub("(.+)\\..*", "\\1", gene_id))
+
+res_WT_vs_dKO <- dds_res_list$dKO_vs_WT %>%
+  mutate(GeneID = sub("(.+)\\..*", "\\1", gene_id))
+
+res_WT_vs_RBM20 <- dds_res_list$RBM20_KO_vs_WT %>%
+  mutate(GeneID = sub("(.+)\\..*", "\\1", gene_id))
+
+# save all dds
+save(res_WT_vs_M3, res_WT_vs_dKO, res_WT_vs_RBM20,
+     file = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/dds_df_full/fulldds_DESeq2.RData")
+```
+
+* Multiple testing correction:
+To reduce false positives when testing thousands of genes simultaneously. In this analysis, Benjamini-Hochberg (false discovery rate) is applied to control for multiple hypothesis testing.
+Also DESeq2 usually applies median-of-ratios normalization (size Factors) internally when modeling counts for differential expression.
+```{r include=FALSE}
+### Information about which variables and tests were used can be found by calling the function mcols on the results object.
+#mcols(res)$description
+```
+
+# EXPLONATORY DATA ANALYSIS
+## P value and P-adj distribution
+Most of p-values distribute between 0 and 1, and a peak of small p-values on the left side, which indicate a uniform background and are not significant. In other words, majority of genes usually has non-differentially expressend genes giving a rough indication of false discovery rate (FDR). That is why p-value is adjusted/ corrected for false discovery rate. False positives (with high p-value) are reduced after multiple testing.
+Source: https://www.huber.embl.de/msmb/08-chap.html 
+The highest bar  after adjustment is the most significant, others are insignificant. P-adj value is more common to use. In this analysis, we could tell most of counts having padj < 0.05, threshhold is set: padj < 0.05.
+```{r include = FALSE}
+# Create a function for histogram plot
+# Store your DESeq2 results in a named list
+mydds_res_list <- list(
+  "Matr3_cKO_vs_WT" = res_WT_vs_M3,
+  "dKO_vs_WT" = res_WT_vs_dKO,
+  "RBM20_KO_vs_WT" = res_WT_vs_RBM20
+)
+
+myColors <- c(
+      "WT" = "#009E73",
+      "Matr3_cKO" = "dodgerblue3",
+      "dKO" = "firebrick3", 
+      "RBM20_KO" = "#FFCC65") 
+
+# Your existing function (slightly optimized for the loop)
+histogram_plot <- function(res_df, comp_name){ 
+  res_df <- as.data.frame(res_df) %>% filter(!is.na(pvalue))
+  
+  hist1 <- ggplot(res_df, aes(x = pvalue)) +
+    geom_histogram(fill = "dodgerblue3", color = "black", bins = 50) + 
+    labs(title = paste(comp_name, "P-value"), x = "p-value", y = "Count") +
+    theme_linedraw()
+  
+  hist2 <- ggplot(res_df, aes(x = padj)) + 
+    geom_histogram(fill = "pink", color = "black", bins = 50) + 
+    labs(title = paste(comp_name, "Adj P-value"), x = "padj", y = "Count") +
+    theme_linedraw()
+  
+  return(gridExtra::arrangeGrob(hist1, hist2, ncol = 2))
+}
+```
+
+```{r, results='asis', fig.width=10, fig.height=4, warning=FALSE, message=FALSE}
+for (comp in names(mydds_res_list)) {
+  # Create the tab heading
+  cat("\n### ", comp, "{.tabset}\n")
+  
+  # Generate and print the plot
+  p <- histogram_plot(mydds_res_list[[comp]], comp)
+  grid::grid.newpage()
+  grid::grid.draw(p)
+  
+  # Add space between tabs
+  cat("\n\n")
+}
+```
+
+
+## Hierarchical Clustering Heatmap/ Sample distance heatmap
+This heatmap shows how different between all samples for evaluating strong patterns between conditions and potential outliers based on normalized gene expression values which is complementary to PCA. Clustered samples, hence, are expected to be similar to PCA plot observation.
+
+* Log-transformed data to stabilize variance and
+blind = F to not ignore differences in conditions and biological variation.
+```{r}
+# Perform rlog transformation
+rld = rlog(dds, blind = F) 
+
+# Compute pairwise distances between samples
+sampleDist = dist(t(assay(rld)))
+sampleMatrix = as.matrix(sampleDist)
+
+# Make a color gradient palette for heatmap
+color = colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+# Create heatmap using pheatmap (simple)
+annotation_df <- as.data.frame(colData(dds)[, "condition", drop = FALSE])
+
+annotation_colors <- list(
+  condition = myColors
+)
+
+pheatmap(
+  sampleMatrix,
+  col = color,
+  clustering_distance_rows = sampleDist,
+  clustering_distance_cols = sampleDist,
+  annotation_col = annotation_df,
+  annotation_row = annotation_df,
+  annotation_colors = annotation_colors,
+  main = "Sample Distance Heatmap (rlog transformed)"
+)
+```
+dKO samples are clustering on a major branch with Matr3-cKO, while RBM20-KO sits on a more distant branch. It might indicate that the loss of Matr3 might be the dominant driver of the phenotype, or that RBM20's targets are a more specific subset of the Matr3 network.
+
+# PCA
+Principal Component Analysis (PCA) helps assess global gene expression patterns across samples. PCA plot is useful for visualizing relationships between samples based on their gene expression profiles which then can be evaluated whether the effect of experimental covariates or detection of batch effects.
+What is a batch effect? The batch effect is usually caused by an unbalanced experimental design, which has the same procedure but different facilities/ reagents, equipment, etc. (non-biological reasons).
+Samples with replicates that are similar in their gene expression will cluster close together; meanwhile, the more different the expression, the more separated the samples. PC1 (first principal component) is mostly aligned with the experimental covariate of interest or captures the most largest variance in data (between control and KD samples). Followed by PC2, the second component, is aligned with the sequencing protocol (between replicates) that captures technical variation helping identify batch effects.
+```{r}
+# PCA data
+PCAdata <- plotPCA(
+  rld,
+  intgroup = c("condition", "replicate"),
+  ntop = 5000,
+  returnData = TRUE
+)
+
+percentVariance <- round(attr(PCAdata, "percentVar") * 100, 2)
+PCAdata$sample_label <- paste0(PCAdata$condition, "_rep", PCAdata$replicate)
+
+# Gender map
+gender_map <- tibble::tribble(
+  ~sample_label,        ~gender,
+  "Matr3_cKO_rep1",     "Male",
+  "Matr3_cKO_rep2",     "Male",
+  "Matr3_cKO_rep3",     "Female",
+  "dKO_rep1",           "Male",
+  "dKO_rep2",           "Male",
+  "dKO_rep3",           "Male",
+  "RBM20_KO_rep1",      "Female",
+  "RBM20_KO_rep2",      "Male",
+  "RBM20_KO_rep3",      "Male",
+  "WT_rep1",            "Male",
+  "WT_rep2",            "Female",
+  "WT_rep3",            "Male"
+)
+
+# Join gender into PCA data
+PCAdata <- PCAdata %>%
+  dplyr::left_join(gender_map, by = "sample_label")
+
+gender_shapes <- c("Female" = 17, "Male" = 16)  # triangle = F, circle = M
+
+# PCA plot — color = condition, shape = gender
+p_pca <- ggplot(PCAdata, aes(PC1, PC2, color = condition, shape = gender)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(size = 4) +
+  geom_text_repel(
+    aes(label = sample_label),
+    size = 4.5,
+    fontface = "bold",
+    max.overlaps = Inf,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = myColors) +
+  scale_shape_manual(values = gender_shapes) +
+  labs(
+    title = "",
+    x = paste0("PC1: ", percentVariance[1], "%"),
+    y = paste0("PC2: ", percentVariance[2], "%"),
+    color = "Condition",
+    shape = "Gender"
+  ) +
+  theme_linedraw(base_size = 13) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title   = element_text(face = "bold", size = 18),
+    axis.text.x  = element_text(color = "black", size = 16),
+    axis.text.y  = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text  = element_text(size = 16),
+    legend.position = "right"   # keep legend so gender is interpretable
+  )
+
+p_pca
+
+save_thesis_plot(
+  p_pca,
+  "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/PCA/PCA_plot_gender.png",
+  width = 7, height = 6
+)
+
+```
+
+
+# Count normalized reads of GOI for validation of RNA-seq results.
+```{r}
+dds_count_df <- counts(dds, normalized = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "GeneID")
+
+
+gender_shapes <- c("Female" = 17, "Male" = 16)  # triangle = female, circle = male
+
+sample_meta_gender <- as.data.frame(colData(dds)) %>%
+  rownames_to_column(var = "sample") %>%
+  mutate(
+    sample_label = paste0(condition, "_rep", replicate)
+  ) %>%
+  left_join(gender_map, by = "sample_label")
+
+mygenes <- gene_anno_df %>%
+  filter(gene_name %in% c("Matr3", "Rbm20")) %>%
+  mutate(myLabel = gene_name)
+
+KOgene_normalcounts <- dds_count_df %>%
+  filter(GeneID %in% mygenes$gene_id) %>%
+  pivot_longer(
+    cols      = -GeneID,
+    names_to  = "sample",
+    values_to = "norm_count"
+  ) %>%
+  left_join(sample_meta_gender, by = "sample") %>%
+  left_join(
+    mygenes %>% dplyr::select(gene_id, gene_name),
+    by = c("GeneID" = "gene_id")
+  )
+
+# Dotplot of normalized counts
+p_ko_counts <- ggplot(
+  KOgene_normalcounts,
+  aes(x = condition, y = norm_count, color = condition, shape = gender)
+) +
+  geom_jitter(width = 0.2, size = 3.5, alpha = 0.8) +
+  facet_wrap(~ gene_name, scales = "free_y") +
+  scale_color_manual(values = myColors) +
+  scale_shape_manual(values = gender_shapes) +
+  theme_bw(base_size = 12) +
+  labs(
+    title  = "",
+    x      = "Condition",
+    y      = "Normalized Counts",
+    color  = "",
+    shape  = "Gender"
+  ) +
+    theme(
+        strip.text   = element_text(size = 20, face = "bold"),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16, angle = 45, hjust = 1),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16)
+  )
+
+p_ko_counts
+
+save_thesis_plot(p_ko_counts, "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/PCA/normalized_count_genes.png", 
+                 width = 10, height = 6)
+```
+
+How are top targets expressed? L2FC 
+Global distribution of L2FC across different conditions
+```{r}
+global_violin_df <- bind_rows(
+  res_WT_vs_M3 %>% mutate(cond = "Matr3_cKO_vs_WT"),
+  res_WT_vs_dKO %>% mutate(cond = "dKO_vs_WT"),
+  res_WT_vs_RBM20 %>% mutate(cond = "RBM20_KO_vs_WT")
+)
+
+mydata_colors <- c(
+      "WT" = "#009E73",
+      "Matr3_cKO_vs_WT" = "dodgerblue3",
+      "dKO_vs_WT" = "firebrick3", 
+      "RBM20_KO_vs_WT" = "#FFCC65"
+    )
+
+ggplot(global_violin_df, aes(x = cond, y = log2FoldChange, fill = cond)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  scale_fill_manual(
+    values = mydata_colors) +
+  labs(
+    title = "Global Expression changes across different conditions",
+    y = "Log2 Fold Change (Knockout vs WT)",
+    x = ""
+  ) +
+  theme(
+    axis.text.x = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none"
+  ) + 
+  coord_cartesian(ylim = c(-3, 3))
+```
+double knockout disrupts the transcriptome more severely than either single knockout, leading to more extreme expression changes in specific targets. Meanwhile RBM20 KO seems to have least changes since L2FC distribution expand around 0.
+
+
+# Upset plot
+```{r}
+# Custom function to generate high-quality UpSet plots with color-coded reproducibility
+plot_reproducible_upset2 <- function(upset_list, filename, main_label, highlight_color = "#2171B5") {
+  
+  # ── 0. Make sure output directory exists ──────────────────────────────
+  out_dir <- dirname(filename)
+  if (!dir.exists(out_dir)) {
+    dir.create(out_dir, recursive = TRUE)
+    message("Created directory: ", out_dir)
+  }
+  
+  # 1. Transform list to UpSet format
+  upset_data <- UpSetR::fromList(upset_list)
+  set_names  <- names(upset_list)
+  
+  # 2. Generate all combinations for intersections (degree >= 2)
+  shared_combos <- unlist(lapply(2:length(set_names), function(x) {
+    combn(set_names, x, simplify = FALSE)
+  }), recursive = FALSE)
+  
+  # 3. Create queries for UpSetR
+  highlight_queries <- lapply(shared_combos, function(combo) {
+    list(query  = UpSetR::intersects,
+         params = combo,
+         color  = highlight_color,
+         active = TRUE)
+  })
+  
+  # 4. Render and Save Plot
+  png(filename = filename, width = 2600, height = 1800, res = 300, bg = "white")
+  
+  p <- UpSetR::upset(
+    upset_data,
+    nsets           = length(set_names),
+    order.by        = "freq",
+    mainbar.y.label = main_label,
+    sets.x.label    = "Editing sites / Replicate",
+    sets.bar.color  = "#08306B",
+    main.bar.color  = "#08306B",
+    queries         = highlight_queries,
+    text.scale      = c(2.0, 1.8, 1.8, 1.6, 2.0, 2.4),
+  )
+  
+  print(p)
+  dev.off()
+}
+
+```
+
+
+```{r}
+library(UpSetR)
+# Prepare data for UpSet plot
+upset_list <- list(
+  "dKO"       = res_WT_vs_dKO[res_WT_vs_dKO$regulated == TRUE,]$GeneID,
+  "Matr3" = res_WT_vs_M3[res_WT_vs_M3$regulated == TRUE,]$GeneID,
+  "RBM20"  = res_WT_vs_RBM20[res_WT_vs_RBM20$regulated == TRUE,]$GeneID
+)
+
+upset_plot_rnaseq <- plot_reproducible_upset2(
+  upset_list = upset_list,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/UpSet/upset_rnaseq.png",
+  main_label = "Significantly regulated genes"
+)
+```
+Matr3 is the primary driver of the transcriptome in this context.
+
+
+# Violin plot of L2FC distribution of high-confidence targets vs other genes
+```{r}
+principal_highconf_tx <- readRDS("/Users/tinkienoob/Master_thesis/MATR3/Hypertribe_bindingsites_analysis/principal_highconf_tx_df.rds")
+
+# Violin plot of L2FC distribution of all genes 
+highconf_violin_df <- global_violin_df %>%
+  filter(cond == "Matr3_cKO_vs_WT") %>%
+  filter(!is.na(log2FoldChange)) %>%
+  mutate(category = ifelse(gene_id %in% rank_M3tx_df$gene_id, 
+                           "High confidence targets", 
+                           "others"))
+
+ggplot(highconf_violin_df, aes(x = category, y = log2FoldChange, fill = category)) +
+  geom_violin(trim = FALSE, alpha = 0.4) +
+  geom_boxplot(width = 0.12, fill = "white", alpha = 0.4, outlier.shape = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  scale_fill_manual(
+    values = c(
+      "High confidence targets" = "dodgerblue3",
+      "others" = "grey80")) +
+  labs(
+    title = "Expression changes of high-confidence targets vs other genes",
+    subtitle = paste(
+      "High-confidence targets:", sum(highconf_violin_df$category == "High confidence targets"),
+      "| Other genes:", sum(highconf_violin_df$category == "others")),
+    y = "Log2 Fold Change (Matr3-cKO vs WT)",
+    x = "") +
+  theme(
+    axis.text.x = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none") + 
+  coord_cartesian(ylim = c(-2, 2))
+
+```
+
+
+Do my top targets behave differently than the rest of the genome upon Matrin3 knockdown?
+```{r}
+ranking_plot_df <- highconf_violin_df %>%
+  left_join(
+    rank_M3tx_df %>% dplyr::select(gene_id, rank),
+    by = "gene_id") %>%
+  filter(!is.na(log2FoldChange)) %>%
+  mutate(
+    rank = ifelse(is.na(rank), "Others", rank),
+    rank = ifelse(is.na(rank), "Others", as.character(rank)),
+    rank = factor(rank, levels = c("High", "Intermediate", "Low", "Others")))
+
+# Global Colors
+tier_colors <- c(
+  "High" = "#CD534C", 
+  "Intermediate" = "#EFC050", 
+  "Low" = "#45B7D1",
+  "Others" = "grey80"
+)
+
+# Global Comparisons
+tier_comparisons <- list(
+  c("High", "Intermediate"),
+  c("High", "Low"),
+  c("Intermediate", "Low")
+)
+
+c1 <- ggplot(ranking_plot_df, aes(x = rank, y = log2FoldChange, fill = rank)) +
+  #geom_violin(trim = FALSE, alpha = 0.7, color = NA) +
+  geom_boxplot(width = 0.7, alpha = 0.7, outlier.shape = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  stat_compare_means(
+    comparisons = tier_comparisons,
+    method = "wilcox.test",
+    aes(label = paste0("p=", after_stat(p.format))),
+    label.y = c(0.4, 0.575, 0.75),
+  size = 6.5) + 
+  scale_fill_manual(values = tier_colors) + 
+  theme_bw(base_size = 16) +
+  theme_thesis() +
+  theme(axis.text.x = element_text(size = 16, face = "bold"),
+        axis.title.y = element_text(size = 16, face = "bold"),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "none") +
+  labs(y = "Log2 Fold Change (MATR3-cKO vs WT)",
+       x = "") +
+  coord_cartesian(ylim = c(-0.5, 1.5))
+
+c1
+
+save_thesis_plot(c1, "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/violintier_L2FC_targets.png", width = 6, height = 7)
+```
+p-value between each pair of data. 
+ggpubr() for stat_compare_mean(), eg. t-test to compare significant whether L2fc significantly dif froom Tier 2 and tier 3
+
+majority of genes are not changing between your KO and WT samples. Matrin3 binding does NOT predict a change in gene expression.
+
+Multiple studies show Matrin3 is a nuclear matrix splicing regulator: it binds intronic pyrimidine‑rich regions and represses or modulates cassette exon inclusion across hundreds of alternative splicing events, often without major changes in total gene expression. 
+=> enriched for Skipped Exons (SE) or Retained Introns (RI).
+=> Differential Splicing Results
+
+Matrin3 also participates in RNA processing more broadly (RNA stability for a limited subset of mRNAs, nuclear retention of hyper‑edited RNAs, interactions with PABPN1 and other RNA‑processing factors), again emphasizing processing and quality control rather than global up‑ or downregulation of mRNA levels.
+```{r}
+####################### Create x and y-axis limits for the zoomed-in plot
+zoom_xlim <- c(-0.5, 0)
+zoom_ylim <- c(0, 0.4)
+
+####################### Create the main ECDF plot
+c2 <- ggplot(
+  ranking_plot_df,
+  aes(x = log2FoldChange, color = rank)
+) +
+  stat_ecdf(
+    geom = "point",
+    aes(y = after_stat(y)),
+    alpha = 0.6,
+    size = 0.8,
+    position = "identity"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = tier_colors) +
+  labs(
+    title = "",
+    x = "Log2 Fold Change (MATR3-cKO vs WT)",
+    y = "Cumulative probability",
+    color = "Confidence level"
+  ) +
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(0, 1)) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.background = element_rect(fill = alpha("white", 0.35), color = NA),
+    legend.key = element_blank()
+  )
+```
+
+# ECDF
+A curve that is more to the left means that group contains a larger fraction of more negative log2 fold changes, so those genes tend to be more downregulated in Matr3-cKO vs WT. A curve that is more to the right means values are less negative or closer to 0. However, others (grey color) shows more significant downregulation meanwhile it is actually not significant. //
+The cumulative distribution of L2FC for high-confidence targets (Tier 1, Tier 2, Tier 3) is shifted to the left compared to other genes, indicating that these targets tend to be more downregulated in the Matr3-cKO condition compared to WT. This suggests that Matrin3 may play a role in maintaining the expression of its high-confidence targets, and their downregulation upon Matrin3 knockout could be a direct consequence of losing Matrin3's regulatory function on these genes. However, the majority of genes (grey curve) do not show this pattern, reinforcing the idea that Matrin3's effect is specific to its high-confidence targets rather than causing widespread changes in gene expression.
+
+```{r}
+####################### Add a rectangle to indicate the zoomed-in area on the main plot
+c2_main <- c2 +
+  annotate(
+    "rect",
+    xmin = zoom_xlim[1], xmax = zoom_xlim[2],
+    ymin = zoom_ylim[1], ymax = zoom_ylim[2],
+    alpha = 0.08,
+    fill = "white",
+    color = "red",
+    linetype = 2, size = 0.7
+  ) +
+  theme(
+  axis.title.x  = element_text(size = 15, face = "bold"),
+  axis.title.y  = element_text(size = 15, face = "bold"),
+  axis.text.x   = element_text(size = 16),
+  axis.text.y   = element_text(size = 16),
+  plot.title    = element_text(size = 20, face = "bold", hjust = 0.5),
+  legend.title  = element_text(size = 16, face = "bold"),
+  legend.text   = element_text(size = 14),
+  legend.key.size = unit(1.0, "cm"),
+  legend.position = "none"
+)
+
+####################### Create the zoomed-in plot (c1) and inset it into the main plot (c2)
+c2_main_inset <- c2_main +
+  inset_element(
+    c1,
+    left = 0.05,
+    bottom = 0.4,
+    right = 0.98,
+    top = 0.05
+  )
+
+####################### extract legend separately
+legend_plot <- c2 +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.background = element_rect(fill = alpha("white", 0.8), color = NA)
+  )
+
+tier_legend <- get_legend(legend_plot)
+
+####################### Create the zoomed-in plot (c2_zoom) with the same data but zoomed in on the specified x and y limits
+c2_zoom <- c2 +
+  coord_cartesian(xlim = zoom_xlim, ylim = zoom_ylim) +
+  labs(title = "zoom-in area", x = NULL, y = NULL) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 14, hjust = 0, face = "bold")
+  )
+
+####################### Combine the main plot with the inset and the zoomed-in plot side by side
+main_with_inset <- ggdraw() +
+  draw_plot(c2_main, x = 0, y = 0, width = 1, height = 1) +
+  #draw_plot(c1, x = 0.17, y = 0.57, width = 0.34, height = 0.32) +   # top-left inset
+  draw_plot(tier_legend, x = 0.7, y = 0.4, width = 0.24, height = 0.20)  # bottom-right legend
+
+####################### combine left and right panels
+ecdf_regulate <- ggdraw() +
+  # left = main plot with inset
+  draw_plot(main_with_inset, x = 0, y = 0, width = 0.66, height = 1) +
+  # right = zoom plot
+  draw_plot(c2_zoom, x = 0.645, y = 0.12, width = 0.37, height = 0.8) +
+  draw_line(
+    x = c(0.38, 0.67),
+    y = 0.3,
+    linetype = "dashed",
+    color = "red",
+    size = 0.7)
+
+ecdf_regulate
+
+save_thesis_plot(ecdf_regulate, "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/ECDF_plot.png", 
+                  width = 9, height = 6)
+```
+
+
+
+
+Tier1 (red) is the most left-shifted among the three tiers in the zoomed region.
+This suggests Tier1 has the strongest negative shift overall.
+In other words, Tier1 targets appear to be most downregulated in the knockout.
+Tier2 (gold) is intermediate.
+It is still clearly left of 0 and follows the same general pattern as Tier1/Tier3.
+Its downregulation looks weaker than Tier1 but stronger than or similar to Tier3, depending on the x-range you focus on.
+Tier3 (blue) is slightly more right-shifted than Tier1, and often a bit right of Tier2 too.
+That suggests Tier3 is the least negatively shifted of the three tiers.
+So Tier3 targets still trend down, but less strongly.
+Others (gray) behave very differently.
+In the full ECDF, the gray curve is much broader and spread across a wider range.
+That means the “Others” group is more heterogeneous: it contains many genes with stronger negative values, but also many values extending toward 0 and positive L2FC.
+So unlike Tier1–3, which look tightly concentrated in a narrow negative range, “Others” seem less coherent as a class.
+
+
+
+# Venn diagram of significant genes vs high-confidence targets
+```{r}
+highconf_tx_overlap_signGenes <- list(
+  "Matr3-cKO"  = unique(res_WT_vs_M3$GeneID[res_WT_vs_M3$regulated == TRUE]),
+  "RBM20-KO"  = unique(res_WT_vs_RBM20$GeneID[res_WT_vs_RBM20$regulated == TRUE]),
+  "dKO" = unique(res_WT_vs_dKO$GeneID[res_WT_vs_dKO$regulated == TRUE]),
+  "High conf tx" = unique(ranking_plot_df$GeneID[ranking_plot_df$category == "High confidence targets"])
+)
+
+ggvenn(
+  highconf_tx_overlap_signGenes, 
+  fill_color = c("#BD241E", "cornflowerblue", "#F5B355", "#009E73"), # Your specific colors
+  fill_alpha = 0.5,    # Transparency (0 to 1)
+  stroke_size = 0.5,   # Thickness of the circle outlines
+  set_name_size = 4,   # Size of the set labels (Matr3-cKO, etc.)
+  text_size = 3,       # Size of the numbers inside the intersections
+  show_percentage = FALSE # Set to TRUE if you want % alongside counts
+) +
+  ggplot2::labs(title = "Overlap of Regulated Genes & High Confidence Targets") +
+  ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
+```
+
+
+```{r}
+# Function to create an UpSet plot for a given dataset and its high-confidence targets
+reghighconf_upset_plot <- function(res_df, dataset_name, high_conf_df) {
+  
+  overlap_list <- list(
+    unique(res_df$gene_id[res_df$up_down == "up"]),
+    unique(res_df$gene_id[res_df$up_down == "down"]),
+    unique(high_conf_df$gene_id[high_conf_df$rank == "Tier1"]), 
+    unique(high_conf_df$gene_id[high_conf_df$rank == "Tier2"]),
+    unique(high_conf_df$gene_id[high_conf_df$rank == "Tier3"])
+    )
+  
+  # Assign names AFTER creating list
+  names(overlap_list) <- c(
+    paste0(dataset_name, "_Up"),
+    paste0(dataset_name, "_Down"),
+    "Tier1", "Tier2", "Tier3")
+  
+  p <- UpSetR::upset(
+    UpSetR::fromList(overlap_list),
+    nsets = length(overlap_list),
+    order.by = "freq",
+    mainbar.y.label = paste("Shared genes in", dataset_name),
+    sets.x.label = "Significantly regulated genes",
+    sets.bar.color = "#64B5F6",
+    main.bar.color = "#0E54B6",
+    text.scale = c(1.2, 1.2, 1, 1, 1, 1)
+  )
+  
+  print(p)
+}
+```
+
+
+```{r results='asis'}
+cat("## Differential Expression Genes of each tier {.tabset}\n\n")
+
+for (dataset_name in names(mydds_res_list)) {
+  
+  cat("###", dataset_name, "\n\n")
+  
+  reghighconf_upset_plot(
+    res_df = mydds_res_list[[dataset_name]],
+    dataset_name = dataset_name,
+    high_conf_df = ranking_plot_df
+  )
+  
+  cat("\n\n")
+}
+```
+
+```{r go-analysis-function}
+# plot_go_enrichment <- function(ego_obj, set_name, n_terms = 6, n_show_genes = 3) {
+#   
+#   plot_df <- as.data.frame(ego_obj) %>%
+#     tidyr::separate(GeneRatio, into = c("gene_count", "bg_count"), sep = "/", convert = TRUE) %>%
+#     mutate(
+#       GeneRatio_num = gene_count / bg_count,
+#       ONTOLOGY = as.character(ONTOLOGY),
+#       geneID = as.character(geneID)
+#     ) %>%
+#     filter(
+#       !is.na(GeneRatio_num),
+#       is.finite(GeneRatio_num),
+#       !is.na(p.adjust),
+#       !is.na(Count),
+#       !is.na(Description),
+#       !is.na(ONTOLOGY)
+#     ) %>%
+#     group_by(ONTOLOGY) %>%
+#     slice_min(p.adjust, n = n_terms, with_ties = FALSE) %>%
+#     ungroup() %>%
+#     mutate(
+#       # term_label = str_wrap(Description, width = 32),
+#       # gene_label = sapply(strsplit(geneID, "/"), function(x) {
+#       #   paste(head(unique(x), n_show_genes), collapse = ", ")
+#       # }),
+#       # gene_label = paste0("(", gene_label, ")"),
+#       
+#       # ---- CHANGE 1: Rename ONTOLOGY abbreviations to full names ----
+#       ONTOLOGY = dplyr::recode(ONTOLOGY,
+#         "BP" = "Biological Process",
+#         "CC" = "Cellular Component",
+#         "MF" = "Molecular Function"
+#       )
+#     ) 
+#   # %>%
+#   #   mutate(term_label = factor(term_label, 
+#   #                           levels = term_label[order(ONTOLOGY, GeneRatio_num)]))
+# 
+#   
+#   # ---- CHANGE 1 continued: Update factor levels to match new labels ----
+#   plot_df$ONTOLOGY <- factor(plot_df$ONTOLOGY, 
+#                               levels = c("Biological Process", 
+#                                          "Cellular Component", 
+#                                          "Molecular Function"))
+#   
+#   ggplot(
+#     plot_df,
+#     aes(
+#       x = GeneRatio_num,
+#       y = reorder(term_label, GeneRatio_num),
+#       color = p.adjust,
+#       size = Count)) +
+#     geom_point(alpha = 0.6) +
+#     ggrepel::geom_text_repel(
+#       aes(label = gene_label),
+#       size = 4,
+#       color = "black",
+#       segment.color = "grey70",
+#       min.segment.length = 0,
+#       direction = "y",
+#       hjust = 0,
+#       nudge_x = 0.004,
+#       box.padding = 0.2,
+#       max.overlaps = Inf,
+#       show.legend = FALSE) +
+#     facet_grid(ONTOLOGY ~ ., scales = "free_y", space = "free_y") +
+#     scale_color_continuous(low = "red", high = "blue", trans = "reverse") +
+#     
+#     # ---- CHANGE 2: Rename size and x-axis labels ----
+#     scale_size_continuous(
+#       name = "Number of\nMATR3 targets"   # renames the Count legend
+#     ) +
+#     
+#     expand_limits(x = max(plot_df$GeneRatio_num, na.rm = TRUE) + 0.015) +
+#     labs(
+#       title = paste("Functional Enrichment of Matrin3", set_name, "genes"),
+#       
+#       # ---- CHANGE 2 continued: Rename x-axis ----
+#       x = "Ratio of MATR3 targets to total genes in respective terms",
+#       y = NULL,
+#       
+#       # ---- CHANGE 3: Rename color legend title ----
+#       color = "Adjusted\np-value"
+#     ) +
+#     theme_light(base_size = 15) +
+#     theme(
+#       plot.title = element_text(hjust = 0.5, face = "bold"),
+#       strip.background = element_rect(fill = "grey20"),
+#       strip.text = element_text(color = "white", face = "bold"),
+#       axis.text.y = element_text(size = 15),
+#       plot.margin = margin(10, 90, 10, 10))
+# }
+```
+
+# without gene names
+```{r}
+plot_go_enrichment <- function(ego_obj, set_name, n_terms = 6) {  # remove n_show_genes argument
+  
+  plot_df <- as.data.frame(ego_obj) %>%
+    tidyr::separate(GeneRatio, into = c("gene_count", "bg_count"), sep = "/", convert = TRUE) %>%
+    mutate(
+      GeneRatio_num = gene_count / bg_count,
+      ONTOLOGY = as.character(ONTOLOGY),
+      geneID = as.character(geneID)
+    ) %>%
+    filter(
+      !is.na(GeneRatio_num),
+      is.finite(GeneRatio_num),
+      !is.na(p.adjust),
+      !is.na(Count),
+      !is.na(Description),
+      !is.na(ONTOLOGY)
+    ) %>%
+    group_by(ONTOLOGY) %>%
+    slice_min(p.adjust, n = n_terms, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      term_label = str_wrap(Description, width = 32),
+      
+      # ---- REMOVED: gene_label generation ----
+      
+      ONTOLOGY = dplyr::recode(ONTOLOGY,
+        "BP" = "Biological Process",
+        "CC" = "Cellular Component",
+        "MF" = "Molecular Function"
+      )
+    )
+  
+  plot_df$ONTOLOGY <- factor(plot_df$ONTOLOGY, 
+                              levels = c("Biological Process", 
+                                         "Cellular Component", 
+                                         "Molecular Function"))
+  
+  ggplot(
+    plot_df,
+    aes(
+      x = GeneRatio_num,
+      y = reorder(term_label, GeneRatio_num),
+      color = p.adjust,
+      size = Count)) +
+    geom_point(alpha = 0.6) +
+
+    
+    facet_grid(ONTOLOGY ~ ., scales = "free_y", space = "free_y") +
+    scale_color_continuous(low = "red", high = "blue", trans = "reverse") +
+    scale_size_continuous(name = "Number of\nMATR3 Targets") +
+  
+    
+    labs(
+      title = paste("Functional Enrichment of Matrin3", set_name, "genes"),
+      x = "Ratio of MATR3 Targets to Total Genes in Term",
+      y = NULL,
+      color = "Adjusted\np-value"
+    ) +
+    theme_light(base_size = 15) +
+    theme(
+        strip.text   = element_text(size = 18, face = "bold"),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.text.y = element_text(color = "black", size = 16),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      strip.background = element_rect(fill = "grey20"),
+      plot.margin = margin(10, 10, 10, 10))  # reduced right margin since no labels
+}
+
+```
+
+# GO term analyis
+```{r}
+# Define your tiers and a static universe 
+tiers <- c("High" = "High", "Intermediate" = "Intermediate", "Low" = "Low")
+M3_universe <- res_WT_vs_M3 %>% filter(baseMean > 5) %>% pull(GeneID)
+
+remove_go_ids <- c("GO:0042692")   # example: muscle cell differentiation
+
+for (tier_label in names(tiers)) {
+  tier <- tiers[[tier_label]]
+  
+  # Create the tabset header
+  cat("\n## ", tier_label, "\n")
+  
+  # Run the enrichment
+  ego <- enrichGO(
+    gene          = rank_M3tx_df[rank_M3tx_df$rank == tier,]$GeneID,
+    universe      = M3_universe,
+    OrgDb         = org.Mm.eg.db,
+    keyType       = "ENSEMBL",  
+    ont           = "ALL",      
+    pAdjustMethod = "BH",       
+    pvalueCutoff  = 0.1,
+    qvalueCutoff  = 0.2,
+    readable      = TRUE
+  )
+
+  p <- plot_go_enrichment(ego, tier_label, n_terms = 6)
+  
+   print(p)
+  
+  cat("\n\n")
+}
+```
+
+
+
+# MA Plot
+```{r ma-plot}
+cat("## MA Plots {.tabset}\n\n")
+
+for (name in names(mydds_res_list)) {
+
+  cat("###", gsub("_", " ", name), "\n\n")
+
+  # Access the specific results dataframe
+  res_df <- mydds_res_list[[name]] %>%
+    filter(baseMean > 5) %>%
+    mutate(
+      is_tier1 = gene_id %in%
+        rank_M3tx_df[rank_M3tx_df$rank == "Tier1", ]$gene_id
+    )
+
+  plot <- ggplot(res_df, aes(x = baseMean, y = log2FoldChange.ashr)) +
+
+    geom_point(
+      aes(color = up_down),
+      size = 1.5,
+      alpha = 0.4
+    ) +
+
+   scale_x_log10(
+  breaks = scales::breaks_log(),
+  labels = scales::label_math(10^.x, format = log10),
+  expand = expansion(mult = c(0.02, 0.05))
+) +
+
+    geom_hline(
+      yintercept = 0,
+      color = "black",
+      linetype = "dashed"
+    ) +
+
+    scale_color_manual(values = c(
+      "up" = "firebrick3",
+      "down" = "dodgerblue3",
+      "not regulated" = "grey80"
+    )) +
+
+   # coord_cartesian(ylim = c(-1.5, 2)) +
+    labs(
+      title = gsub("_", " ", name),
+      x = "Mean of normalized counts",
+      y = "Shrunken Log2 Fold Change"
+    ) +
+
+    theme_bw(base_size = 16) +
+    theme_thesis() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      strip.text = element_text(face = "bold", size = 16),
+      legend.position = "none"
+    ) +
+
+    stat_group_counts(
+      data = ~ subset(.x, up_down == "up"),
+      aes(group = up_down,
+          label = paste("Up:", after_stat(count.label))),
+      geom = "text_npc",
+      npcx = 0.02,
+      npcy = 0.95,
+      hjust = -5,
+      vjust = 1,
+      size = 4
+    ) +
+
+    stat_group_counts(
+      data = ~ subset(.x, up_down == "down"),
+      aes(group = up_down,
+          label = paste("Down:", after_stat(count.label))),
+      geom = "text_npc",
+      npcx = 0.02,
+      npcy = 0.05,
+      hjust = -4,
+      vjust = 0,
+      size = 4
+    )
+
+  print(plot)
+
+  # create unique filename
+  file_name <- paste0(
+    "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/",
+    "MAplot_",
+    name,
+    ".png"
+  )
+
+  save_thesis_plot(
+    plot,
+    file_name,
+    width = 6.5,
+    height = 6
+  )
+
+  cat("\n\n")
+}
+
+```
+# MA plot for Matrin3 only, faceted by tier
+```{r}
+# pick the Matrin3 result table from your list
+MAplot_tier_M3vsWT <- res_WT_vs_M3 %>%
+  filter(gene_id %in% rank_M3tx_df$gene_id) %>%
+  left_join(
+    rank_M3tx_df %>% dplyr::select(gene_id, rank),
+    by = "gene_id") %>%
+  mutate(
+    rank = case_when(
+      rank %in% c("High", "Intermediate", "Low") ~ as.character(rank),
+      TRUE ~ "Others"),
+    rank = factor(rank, levels = c("High", "Intermediate", "Low", "Others")))
+
+tier_counts <- MAplot_tier_M3vsWT %>%
+  group_by(rank) %>%
+  summarise(
+    total = n(),
+    up    = sum(up_down == "up", na.rm = TRUE),
+    down  = sum(up_down == "down", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    up_label   = paste0("Up: ", up, "/", total),
+    down_label = paste0("Down: ", down, "/", total)
+  )
+
+# 👉 compute per-facet positions
+pos_df <- MAplot_tier_M3vsWT %>%
+  group_by(rank) %>%
+  summarise(
+    x_pos = min(baseMean, na.rm = TRUE) * 1.2,
+    y_top = max(log2FoldChange.ashr, na.rm = TRUE) * 0.95,
+    y_bot = min(log2FoldChange.ashr, na.rm = TRUE) * 0.95,
+    .groups = "drop"
+  )
+
+tier_counts <- left_join(tier_counts, pos_df, by = "rank")
+```
+
+
+```{r}
+maplot_tier <- ggplot(
+  MAplot_tier_M3vsWT,
+  aes(x = baseMean, y = log2FoldChange.ashr)
+) +
+  
+  # ── points ───────────────────────────────────
+  geom_point(
+    aes(color = up_down),
+    size = 1.2,
+    alpha = 0.5
+  ) +
+  
+  # ── horizontal reference line ────────────────
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  
+  # ── gene labels ──────────────────────────────
+  # geom_label_repel(
+  #   data = subset(MAplot_tier_M3vsWT, regulated & !is.na(gene_name)),
+  #   aes(label = gene_name, color = up_down),
+  #   size = 5,
+  #   max.overlaps = 10,
+  #   box.padding = 0.1,
+  #   point.padding = 0.1,
+  #   show.legend = FALSE
+  # ) +
+  
+  # ── facet ────────────────────────────────────
+  facet_wrap(~ rank, ncol = 3) +
+  
+  # ── UP label (top-right) ──────────────────────
+  geom_text_npc(
+    data = tier_counts,
+    aes(label = up_label),
+    npcx = 0.98,   # 👉 RIGHT side
+    npcy = 0.98,   # 👉 TOP
+    hjust = 1,     # align text to right edge
+    vjust = 1,
+    size = 6,
+    inherit.aes = FALSE
+  ) +
+
+  # ── DOWN label (bottom-right) ────────────────
+  geom_text_npc(
+    data = tier_counts,
+    aes(label = down_label),
+    npcx = 0.98,   # 👉 RIGHT side
+    npcy = 0.05,   # 👉 BOTTOM
+    hjust = 1,
+    vjust = 0,
+    size = 6,
+    inherit.aes = FALSE
+  ) +
+  
+  scale_color_manual(values = c(
+    "up" = "firebrick3",
+    "down" = "dodgerblue3",
+    "not regulated" = "grey80")) +
+    
+  # 🔥 UPDATED SCALE HERE 🔥
+scale_x_log10(
+    breaks = scales::breaks_log(), # Ensures major grid lines fall on powers of 10
+    labels = scales::label_math(10^.x, format = log10), # Renders proper mathematical superscripts
+    expand = expansion(mult = 0)
+  ) +
+  
+  # ── limits ───────────────────────────────────
+  coord_cartesian(
+    ylim = c(-1, 1.5),
+    xlim = c(6, NA)) +
+  
+  # ── labels ───────────────────────────────────
+  labs(
+    x = "Mean of normalized counts",
+    y = "Shrunkage Log2 Fold Change (MATR3-cKO vs WT)",
+    color = NULL) +
+  
+  # ── theme ────────────────────────────────────
+  theme_bw(base_size = 16) +
+  theme_thesis() +
+  theme(
+    plot.title   = element_text(face = "bold", hjust = 0.5),
+    strip.text   = element_text(face = "bold", size = 16),
+    legend.position = "none")
+
+maplot_tier
+
+save_thesis_plot(maplot_tier, "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/MAplot_tier_M3vsWT.png", width = 14, height = 6)
+
+```
+
+
+```{r}
+# define regulation classes from DE result
+ranking_bar_df <- ranking_plot_df %>%
+  mutate(
+    regulation = case_when(
+      padj < 0.05 & log2FoldChange > 0  ~ "Up",
+      padj < 0.05 & log2FoldChange < 0  ~ "Down",
+      TRUE                              ~ "Not regulated"
+    ),
+    rank = as.character(rank),
+    rank = ifelse(is.na(rank), "Others", rank),
+    rank = factor(rank, levels = c("High", "Intermediate", "Low", "Others")),
+    regulation = factor(regulation, levels = c("Down", "Not regulated", "Up"))
+  )
+
+# count per group
+rank_reg_summary <- ranking_bar_df %>%
+  dplyr::count(rank, regulation, name = "n") %>%
+  group_by(rank) %>%
+  mutate(
+    total = sum(n),
+    prop = n / total
+  ) %>%
+  ungroup()
+
+rank_reg_summary
+```
+
+# Volcano plot
+```{r volcano-plot}
+make_volcano_plot <- function(res_df, dataset_name, ranking_plot_df) {
+  
+  lim <- ceiling(max(abs(res_df$log2FoldChange), na.rm = TRUE) / 0.5) * 0.5
+  
+  volcano_df <- res_df %>%
+    filter(!is.na(padj)) %>%
+    mutate(
+      tier1_transcripts = ifelse(
+        GeneID %in% ranking_plot_df[
+          ranking_plot_df$rank == "Tier1", ]$GeneID,
+        gene_name, NA
+      ),
+      is_key_prot = gene_name %in% c("Matr3", "Rbm20"),
+      neg_log10_padj = -log10(padj),
+      padj_corrected = pmin(neg_log10_padj, 50)
+    )
+  
+  ggplot(volcano_df,
+         aes(x = log2FoldChange,
+             y = padj_corrected,
+             color = up_down)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    geom_label_repel(data = subset(volcano_df, regulated == TRUE & !is_key_prot), 
+                     aes(label = gene_name), 
+                     point.padding = 0.1, 
+                     max.overlaps = 30,
+                     size = 2.5, 
+                     show.legend = FALSE) +
+    geom_point(
+      data = subset(volcano_df, !is.na(tier1_transcripts)), # Label tier 1 transcripts
+      fill = "#FFCC65",
+      color = "black",
+      size = 2,
+      shape = 21) +
+    geom_label_repel(data = subset(volcano_df, !is.na(tier1_transcripts)), 
+                     aes(label = gene_name), 
+                     color = "black", 
+                     fill = "#FFCC65", 
+                     size = 3, 
+                     box.padding = 0.5, 
+                     max.overlaps = 20, 
+                     show.legend = FALSE) +
+    # LABELING for MATR3/RBM20 
+    geom_label_repel(data = subset(volcano_df, is_key_prot), 
+                     aes(label = gene_name),
+                     fontface = "bold", 
+                     size = 4, 
+                     point.padding = 0.75, 
+                     min.segment.length = 0) +
+    scale_color_manual(values = c(
+      "up" = "firebrick3",
+      "down" = "dodgerblue3",
+      "not regulated" = "grey80")) +
+    scale_x_continuous(limits = c(-lim, lim)) +
+    geom_hline(yintercept = -log10(0.05),
+               linetype = "dashed") +
+    geom_vline(xintercept = 0,
+               linetype = "dashed") +
+    theme_bw() +
+    labs(
+      title = paste("Volcano Plot:", gsub("_", " ", dataset_name)),
+      subtitle = "Yellow = Tier 1 Targets",
+      x = "Log2 Fold Change",
+      y = "-Log10(padj)") + 
+    # Quadrant counts for significant regulated genes and not regulated genes 
+    stat_quadrant_counts(xintercept = 0, yintercept = -log10(0.05), 
+                        aes(label = case_when(after_stat(quadrant) == 1 ~ paste0("Up: ", after_stat(count)), 
+                                              after_stat(quadrant) == 2 ~ paste0("Not reg: ", after_stat(count)), 
+                                              after_stat(quadrant) == 3 ~ paste0("Not reg: ", after_stat(count)), 
+                                              after_stat(quadrant) == 4 ~ paste0("Down: ", after_stat(count)), 
+                                              TRUE ~ NA_character_)), 
+                          geom = "text", color = "black", size = 4 ) + 
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+```
+
+
+```{r results='asis'}
+cat("## Volcano Plots {.tabset}\n\n")
+
+for (cond in names(mydds_res_list)) {
+  
+  cat("###", gsub("_", " ", cond), "\n\n")
+  
+  plot <- make_volcano_plot(
+    res_df = mydds_res_list[[cond]],
+    dataset_name = cond,
+    ranking_plot_df = ranking_plot_df
+  )
+  
+  print(plot)
+  
+  cat("\n\n")
+}
+```
+Rbm20 is another splicing factor linked to cardiomyopathy. The upregulation of Rbm20 (a splicing regulator) strongly suggests a splicing network disruption.
+MYH7 is a gene that provides instructions for making the beta-myosin heavy chain protein, a crucial component of cardiac (heart) and slow-twitch skeletal muscles, forming part of the molecular motor for contraction. 
+ACTA2 refers to the Alpha-2 Smooth Muscle Actin gene, which provides instructions for making the actin alpha-2 protein, a crucial component in smooth muscle contraction, cell structure, and blood vessel health. Mutations in the ACTA2 gene are linked to serious genetic conditions like Multisystemic Smooth Muscle Dysfunction Syndrome (MSMDS), Thoracic Aortic Aneurysm and Dissection (TAAD), and premature heart/stroke issues, impacting blood pressure regulation and vascular integrity.
+
+Although Matrin3’s HyperTRIBE‑defined top targets are bound and edited most strongly, their steady‑state expression is largely buffered between WT and cKO, suggesting 
+
+# DEG lists
+```{r, message=FALSE, warnings=FALSE}
+Matr3cKO_sigGenes <- res_WT_vs_M3 %>% subset(regulated == TRUE) %>% pull(GeneID)
+RBM20KO_sigGenes <- res_WT_vs_RBM20  %>% subset(regulated == TRUE) %>% pull(GeneID)
+dKO_sigGenes <- res_WT_vs_dKO  %>% subset(regulated == TRUE) %>% pull(GeneID)
+sigGenes_set <- c(Matr3cKO_sigGenes, RBM20KO_sigGenes, dKO_sigGenes) %>% unique(.)
+```
+
+# GO terms analysis
+::: panel-tabset
+## Significant upregulated genes
+```{r go-analysis-up}
+ego_M3_up <- enrichGO(
+  gene = res_WT_vs_M3[res_WT_vs_M3$up_down == "up",]$GeneID,
+  universe = res_WT_vs_M3$GeneID,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENSEMBL",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+```
+
+
+```{r}
+ego_up_plot <- plot_go_enrichment(ego_M3_up, "upregulated", n_terms = 10)
+
+save_thesis_plot(
+  plot = ego_up_plot,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/go_upregulated.png",
+  width = 9,
+  height = 14.5
+)
+
+ego_up_plot
+```
+
+## Significant downregulated genes
+```{r go-analysis-down}
+ego_M3_down <- enrichGO(
+  gene = res_WT_vs_M3[res_WT_vs_M3$up_down == "down",]$GeneID,
+  universe = res_WT_vs_M3$GeneID,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENSEMBL",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+```
+
+
+```{r}
+ego_down_plot <- plot_go_enrichment(ego_M3_down, "downregulated", n_terms = 10)
+
+save_thesis_plot(
+  plot = ego_down_plot,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/go_downregulated.png",
+  width = 9,
+  height = 13
+)
+
+ego_down_plot
+```
+
+:::
+
+# GO terms separately
+```{r}
+# plot_go_enrichment2 <- function(
+#   ego_obj,
+#   set_name,
+#   ont_name,
+#   n_terms = 6,
+#   n_show_genes = 3,
+#   remove_go_ids = NULL
+# ) {
+#   plot_df <- as.data.frame(ego_obj)
+#   
+#   if (!is.null(remove_go_ids)) {
+#     plot_df <- plot_df %>%
+#       filter(!ID %in% remove_go_ids)
+#   }
+#   
+#   plot_df <- plot_df %>%
+#     tidyr::separate(GeneRatio, into = c("gene_count", "bg_count"), sep = "/", convert = TRUE) %>%
+#     mutate(
+#       GeneRatio_num = gene_count / bg_count,
+#       geneID = as.character(geneID),
+#       term_label = stringr::str_wrap(Description, width = 32),
+#       gene_label = sapply(strsplit(geneID, "/"), function(x) {
+#         paste(head(unique(x), n_show_genes), collapse = ", ")
+#       }),
+#       gene_label = paste0("(", gene_label, ")")
+#     ) %>%
+#     filter(
+#       !is.na(GeneRatio_num),
+#       is.finite(GeneRatio_num),
+#       !is.na(p.adjust),
+#       !is.na(Count),
+#       !is.na(Description)
+#     ) %>%
+#     slice_min(p.adjust, n = n_terms, with_ties = FALSE)
+#   
+#   p <- ggplot(
+#     plot_df,
+#     aes(
+#       x = GeneRatio_num,
+#       y = reorder(term_label, GeneRatio_num),
+#       color = p.adjust,
+#       size = Count
+#     )
+#   ) +
+#     geom_point(alpha = 0.7) +
+#     ggrepel::geom_text_repel(
+#       aes(label = gene_label),
+#       size = 3.2,
+#       color = "black",
+#       segment.color = "grey70",
+#       min.segment.length = 0,
+#       direction = "y",
+#       hjust = 0,
+#       nudge_x = 0.004,
+#       box.padding = 0.2,
+#       max.overlaps = Inf,
+#       show.legend = FALSE
+#     ) +
+#     scale_color_continuous(low = "red", high = "blue", trans = "reverse") +
+#     expand_limits(x = max(plot_df$GeneRatio_num, na.rm = TRUE) + 0.015) +
+#     labs(
+#       title = paste("Functional Enrichment of Matrin3", set_name, "-", ont_name),
+#       x = "Gene Ratio",
+#       y = NULL,
+#       color = "adj. p-value",
+#       size = "Gene count"
+#     ) +
+#     theme_light(base_size = 13) +
+#     theme(
+#       plot.title = element_text(hjust = 0.5, face = "bold"),
+#       axis.text.y = element_text(size = 11),
+#       plot.margin = margin(10, 90, 10, 10)
+#     )
+#   
+#   print(p)
+# }
+```
+
+```{r}
+# regulation_dir <- c("Upregulated" = "up", "Downregulated" = "down")
+# onts <- c("BP", "CC", "MF")
+# 
+# cat("::: panel-tabset\n")
+# 
+# for (dir_label in names(regulation_dir)) {
+#   
+#   dir_value <- regulation_dir[[dir_label]]
+#   
+#   cat("\n## ", dir_label, "\n", sep = "")
+#   cat("\n::: panel-tabset\n")
+#   
+#   target_genes <- res_WT_vs_M3 %>%
+#     dplyr::filter(up_down == dir_value, baseMean > 5) %>%
+#     dplyr::pull(GeneID) %>%
+#     unique() %>%
+#     na.omit()
+#   
+#   cat("Number of genes:", length(target_genes), "\n")
+#   
+#   for (ont_name in onts) {
+#     
+#     cat("\n### ", ont_name, "\n", sep = "")
+#     
+#     ego <- enrichGO(
+#       gene          = target_genes,
+#       universe      = M3_universe,
+#       OrgDb         = org.Mm.eg.db,
+#       keyType       = "ENSEMBL",
+#       ont           = ont_name,
+#       pAdjustMethod = "BH",
+#       pvalueCutoff  = 0.05,
+#       qvalueCutoff  = 0.05,
+#       readable      = TRUE)
+#     
+#     p <- plot_go_enrichment2(
+#       ego_obj = ego,
+#       set_name = dir_label,
+#       ont_name = ont_name,
+#       n_terms = 10,
+#       n_show_genes = 5,
+#       remove_go_ids = remove_go_ids)
+#     
+#     file_name <- paste0(
+#       "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/",
+#       "go_plot_",
+#       gsub("\\s+", "_", dir_label),
+#       "_",
+#       ont_name,
+#       ".png"
+#     )
+#     
+#     ggsave(file_name, plot = p, width = 12, height = 7, dpi = 300)
+#     
+#     print(p)
+#     cat("\n")
+#   }
+#   
+#   cat("\n:::\n")
+# }
+# 
+# cat("\n:::\n")
+
+
+```
+
+# GO compare Tier
+```{r}
+tier_gene_list <- rank_M3tx_df %>%
+  filter(rank_char %in% c("Tier 1", "Tier 2", "Tier 3")) %>%
+  filter(GeneID %in% M3_universe) %>%
+  distinct(rank_char, GeneID) %>%
+  group_by(rank_char) %>%
+  summarise(genes = list(unique(GeneID)), .groups = "drop") %>%
+  tibble::deframe()
+
+
+cc_bp <- compareCluster(
+  geneCluster   = tier_gene_list,
+  fun           = "enrichGO",
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "ALL",
+  universe      = M3_universe,
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+```
+
+```{r}
+dotplot_cc_bp <- dotplot(
+  cc_bp,
+  showCategory = 8
+) +
+  scale_size_continuous(name = "Number of\nMATR3 Targets") +
+  scale_color_continuous(name = "Adjusted\np-value") +
+  theme_bw(base_size = 19) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 20),
+    strip.text       = element_text(size = 18, face = "bold", color = "white"),
+    strip.background = element_rect(fill = "grey20"),
+    axis.title.x     = element_blank(),
+    axis.text.x      = element_text(color = "black", size = 20, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 19),
+    legend.title     = element_text(size = 16, face = "bold"),
+    legend.text      = element_text(size = 15),
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(10, 10, 10, 10)) +
+  guides(
+    color = guide_colorbar(title = "Adjusted\np-value"),
+    size  = guide_legend(title = "Number of\nMATR3 Targets"))
+
+
+save_thesis_plot(
+  plot = dotplot_cc_bp,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/compareCluster_tiers.png",
+  width = 10,
+  height = 13)
+
+dotplot_cc_bp
+```
+
+# Extracting gene tables from GO enrichment results
+```{r}
+#################################### Convert enrichGO into gene table
+# extract_go_gene_table <- function(ego_obj, direction_label = NULL) {
+#   as.data.frame(ego_obj) %>%
+#     dplyr::select(ID, Description, ONTOLOGY, p.adjust, Count, geneID) %>%
+#     separate_rows(geneID, sep = "/") %>%
+#     rename(gene_name = geneID) %>%
+#     mutate(
+#       regulate_dir = direction_label,
+#       gene_symbol = str_trim(gene_name)
+#     ) %>%
+#     distinct()
+# }
+# 
+# ego_up_long   <- extract_go_gene_table(ego_M3_up,   "Up")
+# ego_down_long <- extract_go_gene_table(ego_M3_down, "Down")
+# 
+# ego_all_long <- bind_rows(ego_up_long, ego_down_long)
+```
+
+
+```{r}
+################################### Terms of interest
+# terms_of_interest <- c(
+#   "heart development",
+#   "cardiac muscle tissue development",
+#   "heart morphogenesis",
+#   "cardiac chamber development",
+#   "heart contraction",
+#   "cardiac muscle contraction",
+#   "regulation of cardiac muscle contraction",
+#   "sarcomere organization",
+#   "myofibril assembly",
+#   "myofibril organization",
+#   "actin filament organization",
+#   "actin cytoskeleton organization"
+# )
+# 
+# selected_go_df <- ego_all_long %>%
+#  # filter(p.adjust < 0.05) %>%
+#   mutate(
+#     theme = case_when(
+#       grepl(
+#         "heart development|heart morphogenesis|cardiac chamber development|cardiac muscle tissue development|cardiac cell development|heart looping",
+#         tolower(Description)
+#       ) ~ "Cardiac development",
+# 
+#       grepl(
+#         "heart contraction|cardiac muscle contraction|regulation of cardiac muscle contraction|regulation of heart contraction",
+#         tolower(Description)
+#       ) &
+#       !grepl("smooth muscle", tolower(Description)) ~ "Cardiac contraction",
+# 
+#       grepl(
+#         "sarcomere|myofibril|contractile fiber",
+#         tolower(Description)
+#       ) ~ "Sarcomere / myofibril",
+# 
+#       grepl(
+#         "actin filament|actin cytoskeleton",
+#         tolower(Description)
+#       ) ~ "Actin cytoskeleton",
+# 
+#       TRUE ~ NA_character_
+#     )
+#   ) %>%
+#   filter(!is.na(theme))
+```
+
+
+```{r}
+# ################################### Join tier info and count genes
+# ego_cardiac_theme_df <- selected_go_df %>%
+#   left_join(
+#     rank_M3tx_df %>% dplyr::select(gene_id, gene_name, rank),
+#     by = "gene_name"
+#   ) %>%
+#   filter(!is.na(rank)) %>%
+#   distinct(regulate_dir, theme, gene_name, rank)
+# 
+# ego_theme_cardiac_counts <- ego_cardiac_theme_df %>%
+#   dplyr::count(regulate_dir, theme, rank, name = "n_genes") %>%
+#   complete(
+#     regulate_dir,
+#     theme = c(
+#       "Cardiac development",
+#       "Cardiac contraction",
+#       "Sarcomere / myofibril",
+#       "Actin cytoskeleton"
+#     ),
+#     rank = c("Tier1", "Tier2", "Tier3"),
+#     fill = list(n_genes = 0)
+#   )
+# 
+# ggplot(ego_theme_cardiac_counts, aes(x = n_genes, y = theme, fill = rank)) +
+#   geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+#   facet_wrap(~ regulate_dir) +
+#   scale_fill_manual(values = tier_colors) +
+#   labs(
+#     x = "Number of genes",
+#     y = NULL,
+#     fill = "Tier",
+#     title = "Tier distribution across cardiac-relating functional themes"
+#   ) +
+#   theme_bw(base_size = 12)
+```
+
+
+```{r}
+ego_t1 <- enrichGO(
+  gene = tier_gene_list$`Tier 1`,
+  universe = M3_universe,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENSEMBL",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+  
+ego_t1_simplified <- simplify(
+  ego_t1,
+  cutoff = 0.7,
+  by = "p.adjust",
+  select_fun = min
+)
+
+table(rank_M3tx_df$rank_char)
+```
+
+# GO tier 1
+```{r}
+go_long <- as.data.frame(ego_t1_simplified) %>%
+  separate(GeneRatio, into = c("gene_count", "bg_count"), sep = "/", convert = TRUE) %>%
+  mutate(
+    GeneRatio_num = gene_count / bg_count
+  ) %>%
+  dplyr::select(ID, Description, Count, p.adjust, GeneRatio_num, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  rename(gene_symbol = geneID) %>%
+  left_join(
+    res_WT_vs_M3 %>%
+      dplyr::select(gene_name, up_down),
+    by = c("gene_symbol" = "gene_name")
+  ) %>%
+  mutate(
+    regulation = case_when(
+      up_down == "up"   ~ "Upregulated",
+      up_down == "down" ~ "Downregulated",
+      TRUE              ~ "Not regulated"
+    )
+  )
+
+# -----------------------------
+# 3. Count genes per term and direction
+# -----------------------------
+go_plot_df <- go_long %>%
+  group_by(ID, Description, Count, p.adjust, GeneRatio_num, regulation) %>%
+  summarise(n = n(), .groups = "drop")
+
+# -----------------------------
+# 4. Pick top terms
+# -----------------------------
+top_terms <- go_plot_df %>%
+  distinct(ID, Description, Count, p.adjust, GeneRatio_num) %>%
+  arrange(desc(GeneRatio_num), p.adjust) %>%
+  slice_head(n = 12) %>%
+  mutate(term_label = str_wrap(Description, width = 40))
+
+go_plot_df_top <- go_plot_df %>%
+  semi_join(top_terms, by = "ID") %>%
+  left_join(
+    top_terms %>% dplyr::select(ID, term_label),
+    by = "ID"
+  ) %>%
+  mutate(
+    term_label = fct_reorder(term_label, GeneRatio_num),
+    regulation = factor(
+      regulation,
+      levels = c("Upregulated", "Downregulated", "Not regulated")
+    )
+  )
+
+p_tier1_stack3 <- ggplot(
+  go_plot_df_top,
+  aes(x = n, y = term_label, fill = regulation)
+) +
+  geom_col(width = 0.6) +   # thinner bars
+
+  scale_fill_manual(
+    values = c(
+      "Upregulated"   = "#9FBAD6",
+      "Downregulated" = "#08306B",
+      "Not regulated" = "grey80"
+    )
+  ) +
+
+  labs(
+    x = "Number of genes in GO term",
+    y = NULL
+  ) +
+
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 13),
+    axis.text.x = element_text(size = 12),
+    axis.title.x = element_text(face = "bold"),
+    
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    legend.position = "right",
+    legend.title = element_blank()
+  )
+
+print(p_tier1_stack3)
+
+save_thesis_plot(
+  plot = p_tier1_stack3,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/tier1_enrichment.png",
+  width = 8,
+  height = 7
+)
+```
+
+
+```{r}
+# ── Tier 1 downregulated genes ─────────────────
+tier1_down <- MAplot_tier_M3vsWT %>%
+  filter(rank == "High", up_down == "down") %>%
+  filter(!is.na(gene_id), !is.na(log2FoldChange.ashr))
+
+# ── GO gene mapping ────────────────────────────
+go_gene_tier1 <- ego_t1_simplified@result %>%
+  dplyr::select(ID, Description, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  rename(gene_id = geneID)
+
+# ── JOIN (FIXED) ───────────────────────────────
+go_gene_tier1_df <- go_gene_tier1 %>%
+  left_join(
+    tier1_down %>% dplyr::select(gene_name, log2FoldChange.ashr),
+    by = c("gene_id" = "gene_name")
+  ) %>%
+  filter(!is.na(log2FoldChange.ashr))
+
+term_order <- go_plot_df_top %>%
+  distinct(term_label) %>%
+  pull(term_label)
+
+go_gene_tier1_df <- go_gene_tier1_df %>%
+  mutate(
+    Description = factor(Description, levels = rev(term_order))
+  )
+
+library(ggrepel)
+
+p_fc <- ggplot(
+  go_gene_tier1_df,
+  aes(x = Description, y = log2FoldChange.ashr)
+) +
+  
+  geom_boxplot(
+    fill = "grey90",
+    width = 0.4,
+    outlier.shape = NA
+  ) +
+  
+  geom_jitter(
+    width = 0.15,
+    size = 1.8,
+    color = "#2C7FB8",
+    alpha = 0.7
+  ) +
+
+  # 🔥 LABEL ONLY EXTREME GENES
+  geom_text_repel(
+    data = go_gene_tier1_df %>%
+      group_by(Description) %>%
+      slice_min(log2FoldChange.ashr, n = 1) %>%   # most downregulated
+      bind_rows(
+        go_gene_tier1_df %>%
+          group_by(Description) %>%
+          slice_max(log2FoldChange.ashr, n = 1)   # most upregulated
+      ),
+    aes(label = gene_id),
+    size = 5,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    segment.color = "grey70",
+    max.overlaps = 50
+  ) +
+  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", width = 1) +
+  
+  coord_flip() +
+  
+  labs(
+    x = NULL,
+    y = "Log2 Fold Change"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+
+library(patchwork)
+
+p_combined <- p_fc + p_tier1_stack3 +
+  plot_layout(widths = c(1, 1.2))
+
+ggsave(
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Tier_targets_png/tier1_GO_combined.png",
+  plot = p_combined,
+  width = 14,   # 🔥 increase width
+  height = 7,
+  dpi = 300
+)
+```
+
+
+## Heatmap
+This heatmap shows gene expression patterns across all samples (with rows representing genes and columns representing samples) to visualize co-regulated genes or differential expressed genes.
+Z-score is values representing how far a data point is from the mean, in units of standard deviation (sds - variation in gene expression). The result later can be used for clustering relative expression genes. 
+
+### Normalization:
+The count data of a particular generepresenting the number of sequence reads that reflects both gene expression and various technical factors. The higher the number of counts, the more reads associated with that gene, and the assumption that there was a higher level of expression of that gene in the sample.
+The counts of mapped reads for each gene is proportional to the expression of RNA (“interesting”) in addition to many other factors (“uninteresting”). Normalization is the process of scaling raw count values to account for the “uninteresting” factors. Normalization is essential to correct for these biases (e.g., sequencing depth, gene length, RNA composition), ensuring the expression levels are more comparable between and within samples and accurately reflect biological differences.
+
+Key factors addressed during normalization:
+- Sequencing depth: Adjusts for varying numbers of reads per sample.
+- Gene length: Important for transcript-level quantification.
+- RNA composition: Accounts for highly expressed genes skewing the distribution.
+https://hbctraining.github.io/Training-modules/planning_successful_rnaseq/lessons/sample_level_QC.html 
+```{r}
+dds_matrix <- as.matrix(dds_count_df)
+
+rownames(dds_matrix) <- dds_matrix[,1]
+dds_matrix <- dds_matrix[,-1]
+mode(dds_matrix) <- "numeric"
+
+# Z-score normalization per gene (row)
+# Remove genes with all-zero counts
+matrix_nozero <- dds_matrix[
+  apply(dds_matrix, 1, function(x) any(x != 0)),]
+
+# calculate sd. and mean for each row
+row_means <- rowMeans(matrix_nozero, na.rm = TRUE)
+row_sds   <- apply(matrix_nozero, 1, sd, na.rm = TRUE)
+
+z_matrix <- sweep(matrix_nozero, 1, row_means, "-") # using sweep to subtract row means
+z_matrix <- sweep(z_matrix, 1, row_sds, "/") # 1 is to apply this operation to each row 
+
+# replace NA value with 0 (genes with constant expression across samples will have sd = 0, leading to NA after division)
+z_matrix[is.na(z_matrix)] <- 0
+```
+
+Now we have a matrix (matrix_nozero) containing z-scores. Z-score normalization per gene (row), which standardizes the expression across samples (each row will have a mean ~0 and std ~1 (except for rows with constant values)). Z-score is a form of standardization, but not a normalization method for RNA-seq counts.
+What you did:
+For each gene, you subtract the mean and divide by the standard deviation across samples.
+This gives relative up/down patterns per gene (red = higher than average, blue = lower).
+Purpose: visualize patterns/clustering, not absolute expression levels.
+
+### K-means clustering calculation
+The first step when using k-means clustering is to indicate the number of clusters (k) that will be generated in the final solution. The algorithm starts by randomly selecting k objects from the data set to serve as the initial centers for the clusters. The selected objects are also known as cluster means or centroids. Next, each of the remaining objects is assigned to it’s closest centroid, where closest is defined using the Euclidean distance (Eq. 1) between the object and the cluster mean. This step is called “cluster assignment step”. After the assignment step, the algorithm computes the new mean value of each cluster. The term cluster “centroid update” is used to design this step. Now that the centers have been recalculated, every observation is checked again to see if it might be closer to a different cluster. All the objects are reassigned again using the updated cluster means. The cluster assignment and centroid update steps are iteratively repeated until the cluster assignments stop changing (i.e until convergence is achieved). That is, the clusters formed in the current iteration are the same as those obtained in the previous iteration.(with nstart is a number of random initial configurations (random sets of cluster centroids) the algorithm will try.)
+https://uc-r.github.io/kmeans_clustering 
+```{r}
+# If mat is a data frame, convert and scale if needed
+z_sample <- z_matrix[sample(nrow(z_matrix), 10000), ]
+
+# Run the elbow method on the sample
+fviz_nbclust(
+  z_sample,
+  kmeans,
+  method = "wss",
+  k.max = 10,
+  nstart = 25 # Improve stability
+) +
+labs(title = "Elbow Method for Optimal k on random 10k genes")
+```
+### Heatmap annotation
+```{r}
+coLor = colorRamp2(c(-1, 0, 1), c("dodgerblue3", "white", "firebrick3"))
+
+regulation_colors <- c(
+    "up" = "darkorange",
+    "down" = "#009E73",
+    "not regulated" = "white"
+  )
+
+# Genes of interest
+  genes_of_interest <- c(
+  "Rbm20","Matr3","Xist","Ttn","Cacna1a","Cacna1b","Cacna1c","Cacna1d",
+  "Ldb3","Pdlim5","Camk2a","Camk2d","Camk2g","Rbm14","Rbm24","Rbm39",
+  "Rbm8a","Rbpms","Rbpms2","Mbnl1","Mbnl2","Nppa","Nppb","Myh6","Myh7",
+  "Hnrnpu","Srsf3","Tnnt2","Des","Acta1","Actn2","Mybpc1","Mybpc3","Myocd"
+)
+```
+
+### Column cluster by genes
+```{r}
+set.seed(123)
+# column cluster by different replicates/ conditions
+columncluster = kmeans(t(z_matrix), centers = 2, nstart = 25)
+columnclustersort = order(columncluster$cluster)
+```
+
+
+### Heatmap with different kmeans to identify best clustering
+```{r}
+cluster_list <- list()
+
+for (k in 5:8) {
+
+  set.seed(123)
+
+  # Run k-means on rows
+  km <- kmeans(z_matrix, centers = k, nstart = 25)
+
+  row_split <- km$cluster
+  ord <- order(row_split)
+
+  cluster_list[[paste0("k", k)]] <- row_split
+
+  # Reorder matrix
+  z_ordered <- z_matrix[ord, columnclustersort]
+  row_split_ordered <- row_split[ord]
+  
+  # counts per cluster
+  cluster_levels = sort(unique(row_split_ordered))
+
+  # Get high-confidence genes
+  is_highconf <- rownames(z_ordered) %in% rank_M3tx_df$gene_id
+  
+  # Count high-confidence genes per cluster
+  highconf_counts <- sapply(cluster_levels, function(cluster) {
+    sum(is_highconf[row_split_ordered == cluster])
+  })
+  
+  # Map the cluster-wise counts to each row (gene) in the matrix
+  count_bar_values = highconf_counts[match(row_split_ordered, cluster_levels)]
+
+  # Show label only once per cluster
+  clustercount_labels = ifelse(!duplicated(row_split_ordered), count_bar_values, "")
+  
+  # L2FC annotation: 
+  matr3_anno <- rowAnnotation(
+  Lfc_Matr3 = res_WT_vs_M3$up_down[match(rownames(z_ordered), res_WT_vs_M3$gene_id)],
+  col = list(Lfc_Matr3 = regulation_colors)
+)
+
+rbm20_anno <- rowAnnotation(
+  Lfc_RBM20 = res_WT_vs_RBM20$up_down[match(rownames(z_ordered), res_WT_vs_RBM20$gene_id)],
+  col = list(Lfc_RBM20 = regulation_colors)
+)
+
+dko_anno <- rowAnnotation(
+  Lfc_dKO = res_WT_vs_dKO$up_down[match(rownames(z_ordered), res_WT_vs_dKO$gene_id)],
+  col = list(Lfc_dKO = regulation_colors)
+)
+  
+  ############################ 4. Barplot annotation of number of high confidence genes IN EACH CLUSTER ############################
+  ha <- rowAnnotation(
+    "highconf\ngene\ncounts" = anno_barplot(
+      count_bar_values,
+      gp = gpar(col = "#45B7D1", fill = "#45B7D1"),
+      bar_width = 0.8,
+      width = unit(2, "cm"),
+    axis_param = list(
+      at = c(0, max(count_bar_values, na.rm = TRUE)),
+      labels = c("0", as.character(max(count_bar_values, na.rm = TRUE))),
+      gp = gpar(fontsize = 8))),
+    bar_label = anno_text(
+      clustercount_labels,
+      gp = gpar(fontsize = 8),
+      just = "left",
+      location = 0.1),
+    annotation_name_gp = gpar(fontsize = 9, fontface = "bold"), # Set the name of this label column
+    annotation_name_rot = 0) # Horizontal text for title
+
+  # Heatmap
+  hm <- Heatmap(
+    z_ordered,
+    name = "z-score",
+    column_title = paste0("K-means Clustering (k = ", k, ")"),
+    cluster_columns = FALSE,
+    cluster_rows = FALSE,
+    row_split = row_split_ordered,
+    right_annotation = c(matr3_anno, rbm20_anno, dko_anno, ha),
+    col = coLor,
+    show_row_names = FALSE,
+    use_raster = TRUE
+  )
+
+  draw(hm)
+}
+```
+
+
+# Heatmap of each tier with different k-means clustering
+```{r}
+tier_heatmap <- function(tier_name, k_clusters, show_labels = FALSE) {
+  
+  set.seed(123)
+  z_tier <- z_matrix[rownames(z_matrix) %in% rank_M3tx_df$gene_id[rank_M3tx_df$rank == tier_name], , drop = FALSE]
+  
+  # K-means clustering
+  row_km <- kmeans(z_tier, centers = k_clusters, nstart = 25, iter.max = 100)
+  row_split <- row_km$cluster
+  row_order <- order(row_split)
+  
+  # Order matrix
+  z_ordered <- z_tier[row_order, columnclustersort]
+
+  # Annotation matching
+  idx_M3   <- match(rownames(z_ordered), res_WT_vs_M3$gene_id)
+  idx_RBM  <- match(rownames(z_ordered), res_WT_vs_RBM20$gene_id)
+  idx_dKO  <- match(rownames(z_ordered), res_WT_vs_dKO$gene_id)
+  
+  # Row annotations
+  matr3_anno <- rowAnnotation(
+    L2fc_Matr3 = res_WT_vs_M3$up_down[idx_M3],
+    col = list(L2fc_Matr3 = regulation_colors))
+  
+  rbm20_anno <- rowAnnotation(
+    L2fc_RBM20 = res_WT_vs_RBM20$up_down[idx_RBM],
+    col = list(L2fc_RBM20 = regulation_colors))
+  
+  dko_anno <- rowAnnotation(
+    L2fc_dKO = res_WT_vs_dKO$up_down[idx_dKO],
+    col = list(L2fc_dKO = regulation_colors))
+ right_anno <- c(matr3_anno, rbm20_anno, dko_anno)
+  
+  if (show_labels) {
+    
+    gene_symbols <- res_WT_vs_M3$gene_name[idx_M3]
+    goi_indices <- which(!is.na(gene_symbols) & gene_symbols %in% genes_of_interest)
+    
+    if (length(goi_indices) > 0) {
+      
+      symbol_anno <- rowAnnotation(
+        gene_symbol = anno_mark(
+          at = goi_indices,
+          labels = gene_symbols[goi_indices],
+          labels_gp = gpar(fontsize = 8, fontface = "bold")))
+      
+      right_anno <- c(right_anno, symbol_anno)}
+  }
+  
+  # Heatmap
+  hm <- Heatmap(
+    z_ordered,
+    name = "z-score of normalized counts",
+    col = coLor,
+    cluster_rows = FALSE,
+    cluster_columns = TRUE,
+    row_split = row_split[row_order],
+    column_title = paste0(tier_name, " set of genes"),
+    show_row_names = FALSE,
+    right_annotation = right_anno,
+    use_raster = TRUE
+  )
+  
+  draw(hm)
+}
+
+tier_heatmap("Tier1", k_clusters = 4, show_labels = TRUE)
+tier_heatmap("Tier2", k_clusters = 6, show_labels = TRUE)
+tier_heatmap("Tier3", k_clusters = 6, show_labels = TRUE)
+
+```
+
+
+
+# Classification of compartments: 
+https://pubmed.ncbi.nlm.nih.gov/38964322/
+```{r}
+library(readxl)
+
+compartments_path <- '/Users/tinkienoob/Master_thesis/MATR3/m3_paper/Genome-wide quantification of RNA flow across subcellular compartments reveals determinants of the mammalian transcript life cycle/mmc2.xlsx'
+
+# 2. Define the sheets you want to read
+compartment_sheets <- c("3T3_rates_rep1", "3T3_rates_rep2")
+
+# 3. Read them into a list using lapply
+compartments_list <- lapply(compartment_sheets, function(sheet) {
+  read_excel(compartments_path, sheet = sheet)
+})
+
+# 4. Assign names to the list elements for easy access
+names(compartments_list) <- compartment_sheets
+
+compartment_rate_rep1 <- compartments_list[["3T3_rates_rep1"]]
+compartment_rate_rep2 <- compartments_list[["3T3_rates_rep2"]]
+
+compartment_rate_merged <- compartment_rate_rep1 %>%
+  inner_join(compartment_rate_rep2, by="Gene", suffix=c("_r1","_r2"))
+
+```
+
+
+```{r}
+# Get Matrin3 high confidence transcrips rates
+Matrin3_rates <- compartment_rate_merged %>%
+  filter(Gene %in% rank_M3tx_df$GeneID) %>%
+  dplyr::select(Gene, ends_with(c("Mean_r1", "Mean_r2", "MAP_r1", "MAP_r2"))) 
+
+Matrin3_rates_mean <- Matrin3_rates %>%
+   mutate(
+    across(matches(c("Mean_r[12]$", "MAP_r[12]$")),
+           ~ suppressWarnings(as.numeric(.)))
+  ) %>%
+  mutate(
+    chr_mean = rowMeans(dplyr::select(., matches("half_life_chr.Mean_r[12]$")), na.rm = TRUE),
+    nuc_mean = rowMeans(dplyr::select(., matches("half_life_nuc.Mean_r[12]$")), na.rm = TRUE),
+    nucexp_mean = rowMeans(dplyr::select(., matches("half_life_nucexp_from_nucres_r[12]$")), na.rm = TRUE),
+    cyto_mean = rowMeans(dplyr::select(., matches("half_life_cyto.Mean_r[12]$")), na.rm = TRUE),
+    poly_entry_mean = rowMeans(dplyr::select(., matches("half_life_poly_entry.Mean_r[12]$")), na.rm = TRUE),
+    chr_release_meanMAP = rowMeans(dplyr::select(., matches("half_life_chr_release_from_nucdeg.MAP_r[12]$")), na.rm = TRUE),
+    nudegr_meanMAP = rowMeans(dplyr::select(., matches("half_life_nucdeg.MAP_r[12]$")), na.rm = TRUE),
+    whole_mean = rowMeans(dplyr::select(., matches("half_life_whole_cell.Mean_r[12]$")), na.rm = TRUE)
+  ) %>%
+  left_join(rank_M3tx_df %>% 
+              dplyr::select(GeneID, rank),
+            by = c("Gene" = "GeneID"))
+
+Matrin3_long <- Matrin3_rates_mean %>%
+  dplyr::select(Gene, rank,
+         chr_mean,
+         nuc_mean,
+         cyto_mean,
+         nucexp_mean,
+         poly_entry_mean,
+         chr_release_meanMAP,
+         nudegr_meanMAP,
+         whole_mean) %>%
+  pivot_longer(
+    cols = -c(Gene, rank),
+    names_to = "Stage",
+    values_to = "Half_life") %>%
+  mutate(
+    Stage = recode(Stage,
+                   chr_mean = "Chromatin",
+                   nuc_mean = "Nuclear",
+                   cyto_mean = "Cytoplasm",
+                   nucexp_mean = "Nuclear export",
+                   poly_entry_mean = "Untranslated cytoplasm",
+                   chr_release_meanMAP = "Chromatin release",
+                   nudegr_meanMAP = "Nuclear degradation",
+                   whole_mean = "Whole Cell")) %>%
+  filter(!is.na(Half_life))
+```
+
+
+Nucleus → Cytoplasm → (Untranslated) → Polysome → Decay
+Chromatin
+Nuclear
+Cytoplasm
+```{r}
+stage_counts <- Matrin3_long %>%
+  group_by(Stage, rank) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(Matrin3_long,
+       aes(x = rank,
+           y = Half_life,
+           fill = rank)) +
+  
+  geom_violin(trim = FALSE, width = 0.7, alpha = 0.6, color = NA) +
+  
+  geom_boxplot(width = 0.3, alpha = 0.3,
+               outlier.shape = NA, color = "black") +
+  
+  geom_text(data = stage_counts,
+            aes(x = rank,
+                y = 1200,
+                label = paste0("n=", n)),
+            size = 3.5,
+            vjust = -0.5,
+            inherit.aes = FALSE) +
+  
+  facet_wrap(~ Stage, scales = "fixed") +
+  
+  scale_y_continuous(
+    trans = "log2",
+    limits = c(1, 1800),
+    breaks = c(1, 4, 16, 64, 256, 1024)) +
+  
+  scale_fill_manual(values = tier_colors) +
+  
+  labs(
+    x = "",
+    y = "Half-life (minutes)") +
+  
+  theme_bw(base_size = 15) +
+  theme_thesis() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none")
+```
+
+```{r}
+ks_results <- Matrin3_long %>%
+  group_by(Stage) %>%
+  group_split() %>%
+  map_df(function(df) {
+    pairs <- combn(unique(df$rank), 2, simplify = FALSE)
+    
+    map_df(pairs, function(p) {
+      x <- df %>% filter(rank == p[1]) %>% pull(Half_life)
+      y <- df %>% filter(rank == p[2]) %>% pull(Half_life)
+      
+      ks <- ks.test(x, y, exact = FALSE)
+      
+      data.frame(
+        Stage = unique(df$Stage),
+        group1 = p[1],
+        group2 = p[2],
+        p_value = ks$p.value
+      )
+    })
+  }) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    signif_label = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ "ns"),
+    label = paste0(group2, "-", group1, ": ", signif_label)) 
+  
+  
+ks_results <- ks_results %>%
+  group_by(Stage) %>%
+  mutate(
+    y_pos = seq(0.9, 0.7, length.out = n())
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+a <- ggplot(Matrin3_long,
+       aes(x = Half_life, color = rank)) +
+  stat_ecdf(
+    geom = "point",
+    aes(y = after_stat(y)),
+  #  alpha = 0.2,
+    size = 0.6,
+    position = "identity") +
+  # geom_text(
+  #   data = ks_results,
+  #   aes(x = Inf, y = y_pos, label = label), # x = Inf pushes to the right edge
+  #   hjust = 2.59,                           # Right-aligns text with a small margin
+  #   vjust = 0.5,                              # Bottom-aligns the text box
+  #   inherit.aes = FALSE, 
+  #   size = 5
+  # ) +
+  facet_wrap(~ Stage, scales = "free_x", ncol = 2) +
+  scale_x_continuous(
+    trans = "log2",
+    breaks = c(1, 4, 16, 64, 256, 1024),
+    labels = c(1, 4, 16, 64, 256, 1024)) +
+  scale_color_manual(values = tier_colors) +
+  labs(
+    title = "",
+    x = "Half-life (minutes)",
+    y = "Cumulative probability",
+    color = "Rank") +
+  theme_bw(base_size = 16) +
+  theme_thesis() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold"))
+
+a
+save_thesis_plot(
+  plot = a,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/half_life_ecdf.png",
+  width = 10,
+  height = 12
+)
+```
+ECDF analysis of mRNA half-lives across subcellular compartments showed that Tier1, Tier2, and Tier3 MATR3 targets largely shared similar half-life distributions in chromatin, nuclear, cytoplasmic, untranslated cytoplasmic, and whole-cell fractions. Only modest separation was observed for chromatin-release estimates, where Tier1 targets appeared slightly left-shifted relative to Tier3, suggesting somewhat faster release dynamics. Overall, these results indicate that MATR3 target confidence is not associated with major global differences in transcript stability, supporting a primary role for MATR3 in RNA processing rather than broad regulation of mRNA decay.
+he transcripts in Tier1 tend to have somewhat shorter estimated half-lives for the chromatin-release step than Tier3. In practical terms, those RNAs may spend less time in the chromatin-associated state before moving onward.
+
+That could happen for several reasons:
+	•	these transcripts are inherently processed more efficiently
+	•	they are a transcript class with distinct gene architecture => because more introns? or else? 
+	•	MATR3 binds them during an early processing window => How to know? 
+	•	the estimate reflects a composite of transcription, splicing, and release, not a single pure mechanism
+	
+
+
+```{r}
+ggplot(Matrin3_long,
+       aes(x = Half_life, color = rank)) +
+  stat_ecdf(
+    geom = "point",
+    aes(y = after_stat(y)),
+    size = 0.6,
+    position = "identity") +
+  
+  # 🔥 UPDATED TEXT ALIGNMENT 🔥
+  geom_text(
+    data = ks_results,
+    aes(x = -Inf, y = y_pos, label = label), # x = -Inf anchors to the LEFT edge
+    hjust = 1.05,                            # Left-aligns text, small padding from axis
+    vjust = 0.5,                             
+    inherit.aes = FALSE, 
+    size = 5
+  ) +
+  
+  facet_wrap(~ Stage, scales = "free_x", ncol = 2) +
+  scale_x_continuous(
+    trans = "log2",
+    breaks = c(1, 4, 16, 64, 256, 1024),
+    labels = c(1, 4, 16, 64, 256, 1024)) +
+  scale_color_manual(values = tier_colors) +
+  labs(
+    title = "",
+    x = "Half-life (minutes)",
+    y = "Cumulative probability",
+    color = "Rank") +
+  theme_bw(base_size = 16) +
+  theme_thesis() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold"))
+```
+
+
+# Alluvial diagram
+```{r}
+library(ggalluvial)
+get_regulation <- function(df, condition_label) {
+  df %>%
+    dplyr::transmute(
+      GeneID,
+      gene_id,
+      gene_name,
+      regulation = dplyr::case_when(
+        !is.na(padj) & padj < 0.05 & log2FoldChange.ashr > 0 ~ "Up",
+        !is.na(padj) & padj < 0.05 & log2FoldChange.ashr < 0 ~ "Down",
+        TRUE ~ "Not regulated"
+      )
+    ) %>%
+    dplyr::rename(!!condition_label := regulation)
+}
+
+tier_alluvial_df <- rank_M3tx_df %>%
+  dplyr::filter(rank %in% c("Tier1", "Tier2", "Tier3")) %>%
+  dplyr::distinct(GeneID, gene_id, gene_name, rank) %>%
+  dplyr::left_join(
+    get_regulation(res_WT_vs_M3, "Matr3_cKO"),
+    by = c("GeneID", "gene_id", "gene_name")
+  ) %>%
+  dplyr::left_join(
+    get_regulation(res_WT_vs_RBM20, "RBM20_KO"),
+    by = c("GeneID", "gene_id", "gene_name")
+  ) %>%
+  dplyr::left_join(
+    get_regulation(res_WT_vs_dKO, "dKO"),
+    by = c("GeneID", "gene_id", "gene_name")
+  ) %>%
+  dplyr::mutate(
+    rank      = factor(rank, levels = c("Tier1", "Tier2", "Tier3")),
+    Matr3_cKO = factor(Matr3_cKO, levels = c("Up", "Down", "Not regulated")),
+    dKO       = factor(dKO,       levels = c("Up", "Down", "Not regulated")),
+    RBM20_KO  = factor(RBM20_KO,  levels = c("Up", "Down", "Not regulated"))
+  )
+
+tier_alluvial_summary <- tier_alluvial_df %>%
+  dplyr::count(rank, Matr3_cKO, dKO, RBM20_KO, name = "n")
+
+############################
+# 5. aggregated alluvial plot
+############################
+p_alluvial_summary <- ggplot(tier_alluvial_summary,
+  aes(
+    axis1 = rank,
+    axis2 = Matr3_cKO,
+    axis3 = dKO,
+    axis4 = RBM20_KO,
+    y = n)) +
+  geom_alluvium(
+    aes(fill = rank),
+    width = 1/3,
+    alpha = 0.75) +
+  geom_stratum(
+    color = "black",
+    width = 0.3,
+    alpha = 0.15) +
+  geom_text(
+  stat = "stratum",
+  aes(
+    label = ifelse(
+      after_stat(count) >= 200,
+      paste0(as.character(after_stat(stratum)), "\n", after_stat(count)),
+      "")),
+  size = 3.8,
+  lineheight = 0.9,
+  fontface = "bold") +
+  scale_x_discrete(
+  limits = c("Tier", "Matr3-cKO", "dKO", "RBM20-KO")) +
+  scale_fill_manual(values = tier_colors) +
+  labs(
+    y = "Gene Count",
+    x = "",
+    title = "Alluvial Diagram of Tier Genes Across KO Conditions") +
+   theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(face = "bold", size = 12))
+
+p_alluvial_summary
+
+save_thesis_plot(
+  plot = p_alluvial_summary,
+  filename = "/Users/tinkienoob/Master_thesis/MATR3/Deseq2/GO_deseq2_png/alluvial_summary.png",
+  width = 10,
+  height = 9
+)
+```
+
+```{r}
+down_genes <- go_long %>%
+  filter(regulation == "Downregulated") %>%
+  distinct(gene_symbol)
+
+down_fc <- down_genes %>%
+  left_join(
+    res_WT_vs_M3 %>%
+      dplyr::select(gene_name, log2FoldChange),
+    by = c("gene_symbol" = "gene_name")
+  ) %>%
+  filter(!is.na(log2FoldChange))
+
+down_fc_cardiac <- go_long %>%
+  filter(
+    regulation == "Downregulated",
+    str_detect(Description,
+      regex("cardiac|heart|muscle|sarcomere", ignore_case = TRUE)
+    )
+  ) %>%
+  distinct(gene_symbol) %>%
+  left_join(
+    res_WT_vs_M3 %>%
+      dplyr::select(gene_name, log2FoldChange),
+    by = c("gene_symbol" = "gene_name")
+  ) %>%
+  filter(!is.na(log2FoldChange))
+
+p_hist2 <- ggplot(down_fc_cardiac, aes(x = log2FoldChange)) +
+  geom_histogram(aes(y = ..density..),
+                 bins = 30,
+                 fill = "#08306B",
+                 alpha = 0.6) +
+  geom_density(color = "black", size = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  theme_bw()
+```
+
